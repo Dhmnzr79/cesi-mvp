@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cesi-bot tester</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 20px; }
+  #log { height: 420px; overflow:auto; padding:12px; border:1px solid #ddd; border-radius:10px; background:#fafafa; }
+  .u { color:#555; margin:6px 0; }
+  .b { background:#eef9ff; padding:8px 10px; border-radius:10px; margin:6px 0; }
+  .row { display:flex; gap:8px; margin-top:10px; }
+  input { flex:1; padding:10px; border:1px solid #ddd; border-radius:10px; }
+  button { padding:10px 14px; border:0; border-radius:10px; background:#10a37f; color:white; cursor:pointer; }
+  .btn { margin-right:6px; margin-top:6px; padding:6px 10px; background:#eee; border-radius:8px; display:inline-block; cursor:pointer; }
+  .cta { background:#0ea5e9; color:#fff; }
+  pre { white-space:pre-wrap; margin:0 }
+</style>
+<div id="log"></div>
+<div class="row">
+  <input id="q" placeholder="Напишите вопрос и Enter…" />
+  <button id="send">Отправить</button>
+</div>
+<script>
+const log = document.getElementById('log');
+const q = document.getElementById('q');
+const sid = 'local-' + Math.random().toString(36).slice(2);
+
+function add(html, cls='') {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.innerHTML = html;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function pick(obj, keys, def='') {
+  for (const k of keys) {
+    const v = k.split('.').reduce((o, p) => (o && o[p] !== undefined ? o[p] : undefined), obj);
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+  }
+  return def;
+}
+
+async function ask(text) {
+  add(`<pre>${text}</pre>`,'u');
+  const r = await fetch('/ask', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ q: text })
+  });
+
+  const raw = await r.text();
+  let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+
+  // Обработка ответа от /ask endpoint
+  const answer = data.answer || '(пусто)';
+  const meta = data.meta || {};
+  const follow = Array.isArray(meta.followups) ? meta.followups : [];
+
+  let html = '';
+  if (answer) html += `<div><strong>Ответ:</strong> ${answer}</div>`;
+  
+  // Показываем метаинформацию для отладки
+  if (meta.file) {
+    html += `<div style="font-size:12px; color:#666; margin-top:4px;">
+      Источник: ${meta.file}${meta.h2 ? ' → ' + meta.h2 : ''}${meta.h3 ? ' → ' + meta.h3 : ''} 
+      (score: ${meta.score || 'N/A'})
+    </div>`;
+  }
+
+  if (follow.length) {
+    html += `<div style="margin-top:6px">`;
+    for (const f of follow) {
+      const label = f.label || f.query || 'уточнить';
+      const query = f.query || label;
+      html += `<span class="btn" onclick="ask(${JSON.stringify(query)})">${label}</span>`;
+    }
+    html += `</div>`;
+  }
+
+  // Кнопка показать сырой JSON на случай несоответствий
+  html += `<div style="margin-top:8px"><a href="#" onclick="this.nextSibling.style.display='block';this.remove();return false;">Показать JSON</a><pre style="display:none">${raw.replace(/[<>&]/g, s=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[s]))}</pre></div>`;
+
+  add(html,'b');
+}
+
+document.getElementById('send').onclick = () => {
+  if(q.value.trim()) { ask(q.value.trim()); q.value=''; q.focus(); }
+};
+q.addEventListener('keydown', e => { if(e.key==='Enter'){ e.preventDefault(); document.getElementById('send').click(); }});
+add('Готов! Задай вопрос…','b');
+</script>

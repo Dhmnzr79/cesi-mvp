@@ -1,0 +1,65 @@
+# --- Secrets & env
+.env
+.env.*.local
+.env.local
+
+# --- Logs & runtime artifacts
+logs/
+*.log
+*.pid
+*.seed
+*.out
+*.tmp
+tmp/
+cache/
+.cache/
+__snapshot__/
+
+# --- Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.python-version
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# linters/type checkers
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.tox/
+.nox/
+
+# --- Databases & data
+*.sqlite
+*.sqlite3
+*.db
+data/
+uploads/
+
+# --- Editors/IDE
+.vscode/
+.idea/
+.history/
+*.code-workspace
+*.swp
+*.swo
+
+# --- OS junk
+.DS_Store
+Thumbs.db
+
+# --- Cursor / misc
+.cursor/
