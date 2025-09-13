@@ -18,12 +18,11 @@ empathy_tag: "warranty"
 cta_text: "Уточнить условия гарантии"
 cta_action: "consultation"
 suggest_h3:
-  - "clinic-warranty"
   - "warranty-relocation"
 updated: "2025-09-12"
 ---
 
-## Гарантии в клинике {#clinic-warranty}
+## Гарантии в клинике {#overview}
 - Гарантия на работу врача — **1 год** (корректировки и помощь бесплатно)
 - Импланты **Nobel (Швейцария)** — **пожизненная гарантия**
 - Импланты **Impro (Германия)** — **пожизненная гарантия**

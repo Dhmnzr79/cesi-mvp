@@ -11,6 +11,8 @@
   button { padding:10px 14px; border:0; border-radius:10px; background:#10a37f; color:white; cursor:pointer; }
   .btn { margin-right:6px; margin-top:6px; padding:6px 10px; background:#eee; border-radius:8px; display:inline-block; cursor:pointer; }
   .cta { background:#0ea5e9; color:#fff; }
+  .quick-wrap { margin-top:8px; }
+  .quick-btn { padding:6px 12px; background:#f0f0f0; border:1px solid #ccc; border-radius:6px; cursor:pointer; font-size:13px; }
   pre { white-space:pre-wrap; margin:0 }
 </style>
 <div id="log"></div>
@@ -22,6 +24,310 @@
 const log = document.getElementById('log');
 const q = document.getElementById('q');
 const sid = 'local-' + Math.random().toString(36).slice(2);
+
+// === Стейт для сбора заявки ===
+let leadState = null; // null | 'need_name' | 'need_phone'
+let leadDraft = { name: '', phone: '', intent: 'consultation' };
+let leadAttempts = { name: 0, phone: 0 };
+
+// === Счётчики для умного показа CTA ===
+let lastCtaAt = 0;         // время последнего показа CTA (ms)
+let lastCtaTurn = 0;       // номер последнего пользовательского сообщения, при котором показали CTA
+let ctaShownCount = 0;     // сколько раз показали CTA в этой сессии
+let userTurnCounter = 0;   // счётчик пользовательских сообщений
+let lastCtaJitterMs = 0;   // случайный порог времени между 60-90с
+
+// Кулдаун после выхода из лид-потока (не предлагать запись N сообщений)
+let leadCooldownLeft = 3;  // было 5 — ставим 3
+
+// Тэги высокой конверсии (если придут в resp.meta.tags)
+const HIGH_INTENT_TAGS = new Set(["prices","installments","pain-fears","urgent","surgery","implants","contraindications","first-visit"]);
+
+// Рандомный порог 60–90 секунд
+function nextCtaJitterMs(){
+  return 60000 + Math.floor(Math.random() * 30000); // 60–90с
+}
+
+// === Детекторы интента ===
+function detectExplicitIntent(text){
+  const t = (text||"").toLowerCase();
+  return /(записат|на при[её]м|хочу\s+запис|можно\s*запис|оставить\s*тел|перезвоните|оформить\s*заяв)/iu.test(t);
+}
+
+function hasHighIntentMeta(meta){
+  if (!meta) return false;
+  // Если из бэка придут теги
+  if (Array.isArray(meta.tags) && meta.tags.some(t => HIGH_INTENT_TAGS.has(String(t)))) return true;
+  // Фолбэк по текстам заголовков, если тегов нет
+  const hay = ((meta.h2||"") + " " + (meta.h3||"")).toLowerCase();
+  return /(цена|стоим|рассроч|больно|срочн|имплан|удален|операц|противопоказ)/iu.test(hay);
+}
+
+function ctaMode(meta){
+  // ждём meta.cta_mode из md; если нет — auto
+  const m = meta && meta.cta_mode ? String(meta.cta_mode).toLowerCase() : "auto";
+  if (m === "always" || m === "never") return m;
+  return "auto";
+}
+
+// Вызов из CTA для старта сценария
+function startLeadFlow(intent) {
+  leadDraft = { name: '', phone: '', intent: intent || 'consultation' };
+  leadState = 'need_name';
+  appendBot("Давайте запишем вас. Как к вам обращаться? Только имя, пожалуйста.");
+  
+  // Чтобы не дублировать CTA прямо перед началом лид-потока:
+  lastCtaAt = Date.now();
+  lastCtaTurn = userTurnCounter;
+  
+  renderLeadExitButton('Продолжить диалог');
+}
+
+function exitLeadFlow(){
+  leadState = null;
+  leadDraft = { name:'', phone:'', intent:'consultation' };
+  leadAttempts = { name:0, phone:0 };
+  setPhoneMaskMode && setPhoneMaskMode(false);
+  leadCooldownLeft = 3; // кулдаун: 3 сообщения без автопредложений записи
+}
+
+function renderLeadExitButton(label){
+  const wrap = document.createElement('div');
+  wrap.className = 'quick-wrap';
+  const b = document.createElement('button');
+  b.className = 'quick-btn';
+  b.textContent = label || 'Продолжить диалог';
+  b.onclick = () => { appendBot('Ок, продолжаем. Задайте вопрос — я подскажу.'); exitLeadFlow(); };
+  (document.getElementById('log')||document.body).appendChild(wrap);
+  wrap.appendChild(b);
+}
+
+const CANCEL_PATTERNS = /(отмена|не\s*сейчас|давайте\s*потом|позже|не хочу|передумал|без записи|хочу спросить|вопрос|назад|стоп)/iu;
+function isQuestionish(q){
+  const t = (q||'').toLowerCase();
+  return t.includes('?') || /(как|когда|сколько|где|почему|зачем|можно|нужно|адрес|цена|стоим|имплан|коронк|кт|больно)/iu.test(t);
+}
+document.addEventListener('keydown', (e)=>{ if (leadState && e.key === 'Escape'){ appendBot('Отменяю запись. Можем продолжить диалог.'); exitLeadFlow(); }});
+
+
+// === Каноническая проверка имени ===
+const RU_NAME_DICT = new Set([
+  "Анна","Алёна","Алина","Алиса","Александра","Анастасия","Ангелина","Валерия","Вера","Виктория","Дарья","Диана","Ева","Евгения","Екатерина","Елена","Елизавета","Жанна","Злата","Ирина","Карина","Кира","Ксения","Людмила","Марина","Мария","Майя","Милана","Надежда","Наталья","Оксана","Ольга","Полина","Светлана","София","Таисия","Тамара","Татьяна","Ульяна","Юлия","Яна",
+  "Алексей","Александр","Андрей","Антон","Арсений","Артур","Богдан","Вадим","Валентин","Валерий","Виктор","Виталий","Владимир","Вячеслав","Георгий","Григорий","Даниил","Денис","Дмитрий","Евгений","Егор","Иван","Игорь","Илья","Кирилл","Константин","Леонид","Лев","Максим","Марат","Матвей","Мирон","Михаил","Никита","Олег","Павел","Пётр","Роман","Руслан","Савелий","Сергей","Станислав","Степан","Тимофей","Фёдор","Юрий","Ярослав"
+]);
+
+function levenshtein(a,b){
+  a=a.toLowerCase(); b=b.toLowerCase();
+  const m = Array.from({length:a.length+1}, (_,i)=>[i]);
+  for (let j=0;j<=b.length;j++) m[0][j]=j;
+  for (let i=1;i<=a.length;i++){
+    for (let j=1;j<=b.length;j++){
+      const cost = a[i-1]===b[j-1] ? 0 : 1;
+      m[i][j] = Math.min(
+        m[i-1][j]+1,      // удаление
+        m[i][j-1]+1,      // вставка
+        m[i-1][j-1]+cost  // замена
+      );
+    }
+  }
+  return m[a.length][b.length];
+}
+
+function isInDictOrClose(word){
+  if (RU_NAME_DICT.has(word)) return true;
+  // Разрешим 1 опечатку для коротких (<=5), 2 — для длинных
+  const thr = word.length <= 5 ? 1 : 2;
+  // Быстрая эвристика: сначала проверим первые 2 буквы по совпадениям в словаре
+  const first2 = word.slice(0,2).toLowerCase();
+  for (const n of RU_NAME_DICT){
+    if (n.toLowerCase().startsWith(first2)){
+      if (levenshtein(word, n) <= thr) return true;
+    }
+  }
+  return false;
+}
+
+const RU_VOWELS = "аеёиоуыэюяАЕЁИОУЫЭЮЯ";
+const RU_LETTERS = "абвгдеёжзийклмнопрстуфхцчшщъьюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЬЮЯ";
+
+function _ruOnlyNameChars(s){
+  for (const ch of s){
+    if (ch===' ' || ch==='-') continue;
+    if (!RU_LETTERS.includes(ch)) return false;
+  }
+  return true;
+}
+function _hasVowel(s){
+  for (const ch of s) if (RU_VOWELS.includes(ch)) return true;
+  return false;
+}
+function _noTripleRepeat(s){ return !(/(.)\1\1/u.test(s)); }
+
+function extractLikelyName(input){
+  if (!input) return null;
+  let t = String(input).trim();
+
+  t = t
+    .replace(/^меня\s+зовут\s+/iu, '')
+    .replace(/^я\s*[-—:]\s*/iu, '')
+    .replace(/^это\s+/iu, '')
+    .replace(/[«»"“"]/g,'')
+    .trim();
+
+  // Строго: только кириллица/пробел/дефис, без цифр/латиницы/символов
+  if (!_ruOnlyNameChars(t)) return null;
+  if (!_noTripleRepeat(t)) return null;
+  if (t.length < 2 || t.length > 30) return null;
+
+  // Максимум 2 части (имя или имя-фамилия/двойное имя)
+  const parts = t.split(/[\s-]+/).filter(Boolean);
+  if (parts.length === 0 || parts.length > 2) return null;
+
+  // Каждая часть ок по длине, имеет гласную, и проходит словарь/близость
+  for (let p of parts){
+    if (p.length < 2 || p.length > 15) return null;
+    if (!_hasVowel(p)) return null;
+
+    // Нормализуем регистр для проверки в словаре
+    p = p[0].toUpperCase() + p.slice(1).toLowerCase();
+    if (!(RU_NAME_DICT.has(p) || isInDictOrClose(p))) return null;
+  }
+
+  // Собираем нормализованное имя (Title Case)
+  const norm = parts.map(p => p[0].toUpperCase() + p.slice(1).toLowerCase()).join(' ');
+  return norm;
+}
+
+function isValidName(s){ return !!extractLikelyName(s); }
+
+// === Маска телефона ===
+const inputEl = document.getElementById('q');
+
+function digitsOnly(s){ return (s || '').replace(/\D+/g,''); }
+
+// Нормализация к 11 цифрам РФ, возвращает строку из 11 цифр, где первая — '7', либо null
+function normalizeRuDigits(raw){
+  let d = digitsOnly(raw);
+  if (!d) return null;
+  // Если начинается с 8 — заменяем на 7
+  if (d.length === 11 && d[0] === '8') d = '7' + d.slice(1);
+  // Если начинается с 9 и длина 10 — добавим 7
+  if (d.length === 10 && d[0] === '9') d = '7' + d;
+  // Если начинается с 7 и длина 11 — ок
+  if (d.length === 12 && d.startsWith('07')) d = d.slice(1); // на всякий случай
+  if (d.length !== 11 || d[0] !== '7') return null;
+  return d;
+}
+
+// Форматируем в +7(XXX)XXX-XX-XX
+function formatRuMask(d11){
+  const d = d11;
+  return `+7(${d.slice(1,4)})${d.slice(4,7)}-${d.slice(7,9)}-${d.slice(9,11)}`;
+}
+
+// Управление режимом маски
+let maskHandlersAttached = false;
+
+function setPhoneMaskMode(on){
+  if (!inputEl) return;
+  if (on && !maskHandlersAttached){
+    inputEl.placeholder = '+7(900)000-00-00';
+    inputEl.maxLength = 18; // длина маски
+    inputEl.addEventListener('input', onPhoneInput);
+    inputEl.addEventListener('paste', onPhonePaste);
+    maskHandlersAttached = true;
+    // Если сейчас пусто — подставим +7(
+    if (!inputEl.value) inputEl.value = '+7(';
+    // курсор в конец
+    requestAnimationFrame(()=> inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length));
+  } else if (!on && maskHandlersAttached){
+    inputEl.removeEventListener('input', onPhoneInput);
+    inputEl.removeEventListener('paste', onPhonePaste);
+    inputEl.placeholder = '';
+    inputEl.maxLength = 500;
+    maskHandlersAttached = false;
+  }
+}
+
+function onPhonePaste(e){
+  e.preventDefault();
+  const txt = (e.clipboardData || window.clipboardData).getData('text');
+  const d = normalizeRuDigits(txt);
+  if (d){
+    inputEl.value = formatRuMask(d);
+  } else {
+    // вставим только цифры из буфера в текущую маску
+    const merged = digitsOnly(inputEl.value + txt);
+    const fallback = normalizeRuDigits(merged);
+    inputEl.value = fallback ? formatRuMask(fallback) : '+7(';
+  }
+  requestAnimationFrame(()=> inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length));
+}
+
+function onPhoneInput(e){
+  const raw = inputEl.value;
+  // Собираем все цифры, нормализуем
+  let d = digitsOnly(raw);
+  // Если пользователь начал не с +7 — помогаем
+  if (d.startsWith('8') && d.length <= 11) d = '7' + d.slice(1);
+  if (d.startsWith('9') && d.length <= 10) d = '7' + d;
+  // Обрежем до 11
+  if (d.length > 11) d = d.slice(0,11);
+
+  if (d.length === 0){
+    inputEl.value = '+7(';
+    return;
+  }
+  if (d[0] !== '7'){
+    d = '7' + d.replace(/^./,'');
+  }
+  // Частичное форматирование по мере ввода
+  let out = '+7(';
+  if (d.length >= 2) out += d.slice(1,4);
+  if (d.length >= 4) out += ')';
+  if (d.length >= 5) out += d.slice(4,7);
+  if (d.length >= 7) out += '-';
+  if (d.length >= 8) out += d.slice(7,9);
+  if (d.length >= 9) out += '-';
+  if (d.length >= 10) out += d.slice(9,11);
+  inputEl.value = out;
+}
+
+function pickFinalPhone(){
+  const d = normalizeRuDigits(inputEl.value);
+  return d ? ('+' + d) : null;
+}
+
+// Камчатка: проверка рабочего времени
+function clinicOpenInfo() {
+  const parts = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Asia/Kamchatka',
+    weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false
+  }).formatToParts(new Date());
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const wd = (map.weekday || '').toLowerCase();   // 'пн','вт','ср','чт','пт','сб','вс'
+  const hour = Number(map.hour || 0);
+  const minute = Number(map.minute || 0);
+  const t = hour + minute/60;
+
+  const isSun = wd.startsWith('вс');
+  const isSat = wd.startsWith('сб');
+  let open = false, next = null;
+  if (isSun) {
+    open = false; next = 'Пн с 08:00 (Камчатка)';
+  } else if (isSat) {
+    open = (t >= 8 && t < 14);
+    next = t < 8 ? 'Сегодня с 08:00 (Камчатка)' : (!open ? 'Пн с 08:00 (Камчатка)' : null);
+  } else {
+    open = (t >= 8 && t < 20);
+    next = t < 8 ? 'Сегодня с 08:00 (Камчатка)' : (!open ? 'Завтра с 08:00 (Камчатка)' : null);
+  }
+  return { open, next };
+}
+
+// Хелперы для вывода сообщений ассистента/пользователя
+function appendBot(text) { add(`<pre>${text}</pre>`, 'b'); }
+function appendUser(text) { add(`<pre>${text}</pre>`, 'u'); }
 
 function add(html, cls='') {
   const d = document.createElement('div');
@@ -39,51 +345,262 @@ function pick(obj, keys, def='') {
   return def;
 }
 
-async function ask(text) {
-  add(`<pre>${text}</pre>`,'u');
-  const r = await fetch('/ask', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ q: text })
-  });
-
-  const raw = await r.text();
-  let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
-
-  // Обработка ответа от /ask endpoint
-  const answer = data.answer || '(пусто)';
-  const meta = data.meta || {};
-  const follow = Array.isArray(meta.followups) ? meta.followups : [];
+function renderAnswerBlock(data, rawText){
+  const meta = (data && data.meta) || {};
+  const answer = (data && typeof data.answer === 'string' && data.answer.trim()) ? data.answer : null;
 
   let html = '';
-  if (answer) html += `<div><strong>Ответ:</strong> ${answer}</div>`;
-  
-  // Показываем метаинформацию для отладки
+  if (answer) {
+    html += `<div><strong>Ответ:</strong> ${answer}</div>`;
+  } else {
+    html += `<div><strong>Ответ:</strong> (ошибка)</div>`;
+    html += `<div style="font-size:12px;color:#a00;margin-top:4px;">Бэкенд вернул пустой или невалидный ответ.</div>`;
+  }
   if (meta.file) {
-    html += `<div style="font-size:12px; color:#666; margin-top:4px;">
-      Источник: ${meta.file}${meta.h2 ? ' → ' + meta.h2 : ''}${meta.h3 ? ' → ' + meta.h3 : ''} 
-      (score: ${meta.score || 'N/A'})
-    </div>`;
+    html += `<div style="font-size:12px;color:#666;margin-top:4px;">Источник: ${meta.file}${meta.h2?' → '+meta.h2:''}${meta.h3?' → '+meta.h3:''}${meta.score!==undefined?' (score: '+meta.score+')':''}</div>`;
   }
-
-  if (follow.length) {
-    html += `<div style="margin-top:6px">`;
-    for (const f of follow) {
-      const label = f.label || f.query || 'уточнить';
-      const query = f.query || label;
-      html += `<span class="btn" onclick="ask(${JSON.stringify(query)})">${label}</span>`;
-    }
-    html += `</div>`;
-  }
-
-  // Кнопка показать сырой JSON на случай несоответствий
-  html += `<div style="margin-top:8px"><a href="#" onclick="this.nextSibling.style.display='block';this.remove();return false;">Показать JSON</a><pre style="display:none">${raw.replace(/[<>&]/g, s=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[s]))}</pre></div>`;
+  const safe = String(rawText||'').replace(/[<>&]/g, s=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[s]));
+  html += `<div style="margin-top:8px"><a href="#" onclick="this.nextSibling.style.display='block';this.remove();return false;">Показать JSON</a><pre style="display:none">${safe}</pre></div>`;
 
   add(html,'b');
+  const lastMsgEl = log && log.lastElementChild;
+  if (lastMsgEl && data) renderUx(lastMsgEl, data);
+  if (lastMsgEl && data && data.cta) maybeRenderCta(lastMsgEl, data, '');
+}
+
+async function ask(text) {
+  let raw = ''; let data = null; let ok = false;
+  try {
+    const r = await fetch('/ask', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ q: text })
+    });
+    raw = await r.text();
+    try { data = JSON.parse(raw); ok = r.ok; } catch(e){ data = null; }
+  } catch(e) {
+    raw = String(e);
+  }
+
+  renderAnswerBlock(data, raw);
+  
+  return data || { raw, ok };
+}
+
+// === Умный показ CTA ===
+function maybeRenderCta(containerEl, resp, latestUserText){
+  // Предпосылки
+  if (!resp || !resp.cta) return;
+  if (leadState) return;                // в лид-потоке кнопку не показываем
+  if (leadCooldownLeft > 0) return;     // кулдаун после отказа
+  if (!containerEl) return;
+
+  const mode = ctaMode(resp.meta);
+  if (mode === "never") return;
+
+  const now = Date.now();
+  const timePassed = now - (lastCtaAt || 0);
+  if (!lastCtaJitterMs) lastCtaJitterMs = nextCtaJitterMs();
+
+  // Правила показа
+  const explicit = detectExplicitIntent(latestUserText);
+  const hiIntent = hasHighIntentMeta(resp.meta);
+  const timeOk   = timePassed >= lastCtaJitterMs && (userTurnCounter - lastCtaTurn) >= 2;
+  const limitOk  = (ctaShownCount < 3) || (mode === "always"); // ограничим общее число показов
+
+  let show = false;
+  if (mode === "always") show = true;
+  else if (explicit)     show = true;
+  else if (hiIntent)     show = true;
+  else if (timeOk && limitOk) show = true;
+
+  if (!show) return;
+
+  // Рендер единственной CTA-кнопки
+  const btn = document.createElement('button');
+  btn.className = 'cta-btn';
+  btn.textContent = resp.cta.text || 'Записаться на консультацию';
+  btn.onclick = () => {
+    const intent = resp.cta.action || 'consultation';
+    startLeadFlow(intent);         // ваш уже существующий старт инлайн-заявки
+  };
+  containerEl.appendChild(btn);
+
+  // Обновить метрики показа
+  lastCtaAt = now;
+  lastCtaTurn = userTurnCounter;
+  ctaShownCount += 1;
+  lastCtaJitterMs = nextCtaJitterMs(); // заново бросим порог
+}
+
+// Функция рендера UX-элементов (быстрые ссылки)
+function renderUx(containerEl, resp){
+  if (!containerEl || !resp) return;
+
+  const meta = resp.meta || {};
+  const isOverview = !!meta.is_overview;
+
+  // followups приходит уже отфильтрованный (для overview)
+  let followups = Array.isArray(meta.followups) ? meta.followups : [];
+  let quickRefs = Array.isArray(resp.quick_replies) ? resp.quick_replies : [];
+
+  // Дедуп по label/ref, приоритет у quickRefs
+  const labelsInRefs = new Set(quickRefs.map(x => (x.label||'').toLowerCase()));
+  followups = followups.filter(x => !labelsInRefs.has((x.label||'').toLowerCase()));
+
+  // Выбираем ровно 2 кнопки:
+  let buttons = [];
+  if (isOverview && followups.length > 0) {
+    buttons.push(followups[0]);         // 1 followup
+    if (quickRefs.length > 0) buttons.push(quickRefs[0]); // + 1 ref
+  } else {
+    // внутренний раздел или одночанковый файл: до 2 refs
+    buttons = quickRefs.slice(0, 2);
+  }
+  
+  // Дедуп по ref/label
+  const seen = new Set();
+  buttons = buttons.filter(b => {
+    const key = (b.ref || b.label || '').toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Рендер
+  if (buttons.length){
+    const wrap = document.createElement('div');
+    wrap.className = 'quick-wrap';
+    for (const b of buttons){
+      const el = document.createElement('span');
+      el.className = 'btn';
+      el.textContent = b.label || 'Подробнее';
+      el.onclick = () => {
+        if (b.ref) sendRef(b.ref); else if (b.query) sendQuestion(b.query);
+      };
+      wrap.appendChild(el);
+    }
+    containerEl.appendChild(wrap);
+  }
+}
+
+// Функция отправки по ref
+async function sendRef(ref){
+  try{
+    const r = await fetch('/ask', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ref })
+    });
+    const raw = await r.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch(e){ data = { answer: '(ошибка парсинга JSON)', meta:{}, raw }; }
+    renderAnswerBlock(data, raw);
+  } catch(e){
+    appendBot('(сеть недоступна)');
+  }
+}
+
+// Функция отправки вопроса с перехватом leadState
+async function sendQuestion(text) {
+  const q = (text || '').trim();
+  if (!q) return;
+  if (leadCooldownLeft > 0) leadCooldownLeft--; // тик кулдауна
+
+  if (leadState && (CANCEL_PATTERNS.test(q) || isQuestionish(q))) {
+    appendUser(q);
+    appendBot('Хорошо, выхожу из записи. Слушаю ваш вопрос 🙂');
+    exitLeadFlow();
+    // не делаем return — ниже пойдёт обычная отправка на /ask
+  }
+
+  // учёт хода пользователя
+  userTurnCounter += 1;
+
+  // Сброс маски при обычных вопросах
+  if (!leadState) setPhoneMaskMode(false);
+
+  // Если идёт сбор лида — перехватываем сообщения
+  if (leadState === 'need_name') {
+    appendUser(q);
+    const nameNorm = extractLikelyName(q);
+    leadAttempts.name++;
+    if (!nameNorm) {
+      appendBot('Нужно только имя кириллицей, например: «Анна», «Егор», «Анна-Мария». Если удобно — напишите «Меня зовут Анна».');
+      if (leadAttempts.name >= 1) renderLeadExitButton('Продолжить диалог');
+      if (inputEl) inputEl.focus();
+      return;
+    }
+    leadAttempts.name = 0;
+    leadDraft.name = nameNorm;
+    leadState = 'need_phone';
+    appendBot(`Приятно познакомиться, ${leadDraft.name}! Укажите, пожалуйста, номер телефона. Можно в любом виде — я сам приведу к формату.`);
+    setPhoneMaskMode(true);
+    if (inputEl) { inputEl.value = '+7('; inputEl.focus(); }
+    return;
+  }
+
+  if (leadState === 'need_phone') {
+    appendUser(q);
+    const phone = pickFinalPhone();
+    leadAttempts.phone++;
+    if (!phone) {
+      appendBot('Не похоже на номер. Введите телефон в формате +7(900)000-00-00 — я помогу.');
+      if (leadAttempts.phone >= 1) renderLeadExitButton('Продолжить диалог');
+      if (inputEl) inputEl.focus();
+      return;
+    }
+    leadAttempts.phone = 0;
+
+    // Проверка рабочего времени
+    const info = clinicOpenInfo();
+
+    // Отправляем заявку
+    try {
+      const res = await fetch('/lead', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ name: leadDraft.name, phone: phone, intent: leadDraft.intent })
+      });
+      const j = await res.json();
+      if (j.ok) {
+        appendBot(info.open
+          ? `Спасибо! Заявка принята. Администратор свяжется с вами в ближайшее время.`
+          : `Спасибо! Заявка принята. Сейчас клиника не работает. Мы обязательно перезвоним в рабочее время (${info.next}).`);
+      } else {
+        appendBot('Не получилось отправить заявку. Проверьте номер и попробуйте ещё раз.');
+        if (inputEl) inputEl.focus();
+        return;
+      }
+    } catch(e) {
+      appendBot('Сеть недоступна. Попробуйте ещё раз позже.');
+      return;
+    } finally {
+      // Сброс
+      exitLeadFlow();
+    }
+    return;
+  }
+
+  // Обработка команды "записаться" без кнопки
+  if (!leadState && detectExplicitIntent(q)) { 
+    startLeadFlow('consultation'); 
+    return; 
+  }
+
+  // Обычный режим: отправляем вопрос на бэк
+  appendUser(q);
+  const resp = await ask(q);
+  
+  // Умный показ CTA после ответа
+  if (resp && resp.cta) {
+    const lastMsgEl = log.lastElementChild; // последний добавленный элемент
+    maybeRenderCta(lastMsgEl, resp, q);
+  }
 }
 
 document.getElementById('send').onclick = () => {
-  if(q.value.trim()) { ask(q.value.trim()); q.value=''; q.focus(); }
+  if(q.value.trim()) { sendQuestion(q.value.trim()); q.value=''; q.focus(); }
 };
 q.addEventListener('keydown', e => { if(e.key==='Enter'){ e.preventDefault(); document.getElementById('send').click(); }});
 add('Готов! Задай вопрос…','b');

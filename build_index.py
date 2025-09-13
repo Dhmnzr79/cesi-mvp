@@ -1,12 +1,29 @@
 import os, json, re, glob, numpy as np, frontmatter
 from dotenv import load_dotenv
 from openai import OpenAI
-from logging_setup import log_json, setup_logging
+# --- logging (устойчиво) ---
+try:
+    from logging_setup import log_json, setup_logging  # если есть твой модуль
+except Exception:
+    import logging, json as _json
+    def log_json(logger, msg, **fields):
+        try:
+            logger.info(f"{msg} " + _json.dumps(fields, ensure_ascii=False))
+        except Exception:
+            logger.info(msg)
+    def setup_logging():
+        logger = logging.getLogger("builder")
+        if not logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+            logger.addHandler(h)
+            logger.setLevel(logging.INFO)
+        return logger
+# инициализация
+logger = setup_logging()
+# --- /logging ---
 
 load_dotenv()
-
-# Настройка логирования
-logger = setup_logging()
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:

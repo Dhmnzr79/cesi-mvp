@@ -1,5 +1,7 @@
 import os, json, numpy as np, time
 import re
+from datetime import datetime
+from uuid import uuid4
 from dotenv import load_dotenv
 from meta_loader import get_doc_meta, get_doc_path
 load_dotenv()
@@ -14,6 +16,143 @@ DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "dev-debug")
 
 CONTACTS_RE = re.compile(r"(адрес|где.*находитесь|как\s+(доехать|проехать)|время\s+работы|график|телефон|whatsapp|карта|расположение)", re.I)
 PRICES_RE = re.compile(r"(цена|стоимост|сколько\s+стоит|прайс|расценк|по\s+цене|сколько\s+будет|сколько\s+руб)", re.I)
+
+# ---- JSON sanitize helpers ----
+def _to_plain(o):
+    import numpy as _np
+    if isinstance(o, (_np.floating,)):
+        return float(o)
+    if isinstance(o, (_np.integer,)):
+        return int(o)
+    if isinstance(o, _np.ndarray):
+        return o.tolist()
+    if isinstance(o, set):
+        return list(o)
+    return o
+
+def _sanitize(x):
+    if isinstance(x, dict):
+        return {k: _sanitize(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_sanitize(v) for v in x]
+    return _to_plain(x)
+
+def safe_jsonify(payload):
+    return jsonify(_sanitize(payload))
+# ---- end helpers ----
+
+# --- ids helper ---
+def _h_ids(d: dict):
+    """Безопасно достаём h2/h3 из чанка (поддержка h2_id/h3_id)."""
+    if not isinstance(d, dict): 
+        return (None, None)
+    h2 = d.get("h2") or d.get("h2_id")
+    h3 = d.get("h3") or d.get("h3_id")
+    return (h2, h3)
+
+def _get_ids(chunk: dict):
+    """Вернёт (h2_id, h3_id) безопасно."""
+    if not isinstance(chunk, dict): return (None, None)
+    return (chunk.get("h2_id"), chunk.get("h3_id"))
+
+def _is_overview_by_ids(h2_id, h3_id):
+    h2 = (h2_id or "").strip().lower()
+    h3 = (h3_id or "").strip().lower()
+    return (not h2 and not h3) or (h2 == "overview") or (h3 == "overview")
+
+def _extract_id_from_heading(txt: str):
+    """Возвращает id из строки заголовка вида 'Заголовок {#id}'. Если нет — None."""
+    if not isinstance(txt, str): return None
+    m = re.search(r"\{\s*#([^\}]+)\s*\}", txt)
+    return m.group(1).strip() if m else None
+# --- end helper ---
+
+def _heading_label(md_file: str, sect_id: str):
+    """
+    Возвращает текст заголовка для H3/H2 по его {#id}.
+    Если не нашли — вернём id, приведённый к "Человекочитаемо".
+    """
+    if not md_file or not sect_id:
+        return (sect_id or "").replace('-', ' ').capitalize()
+    try:
+        path = get_doc_path(os.path.basename(md_file)) or md_file
+        with open(path, 'r', encoding='utf-8') as f:
+            txt = f.read()
+        # сначала H3, потом H2
+        rx3 = re.compile(rf'^###\s+(.*?)\s*\{{#{re.escape(sect_id)}\}}\s*$', re.M | re.I)
+        rx2 = re.compile(rf'^##\s+(.*?)\s*\{{#{re.escape(sect_id)}\}}\s*$',  re.M | re.I)
+        m = rx3.search(txt) or rx2.search(txt)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return (sect_id or "").replace('-', ' ').capitalize()
+
+
+def get_chunk_by_ref(ref: str):
+    if not ref or "#" not in ref: return None
+    fname, anchor = ref.split("#", 1)
+    base = os.path.basename(fname)
+    a = (anchor or "").strip().lower()
+    corpus = _load_corpus_if_needed()
+    cands = [ch for ch in corpus if os.path.basename(ch.get("file","") or "") == base]
+    if not cands: return None
+    if a in ("overview", "", None):
+        for ch in cands:
+            if not ch.get("h2_id") and not ch.get("h3_id"):
+                ch["_score"] = 1.0; return ch
+        ch = cands[0]; ch["_score"] = 1.0; return ch
+    for ch in cands:
+        hid2 = ch.get("h2_id") or _extract_id_from_heading(ch.get("h2"))
+        hid3 = ch.get("h3_id") or _extract_id_from_heading(ch.get("h3"))
+        if a in {
+            (hid3 or "").lower(),
+            (hid2 or "").lower(),
+            str(ch.get("h3") or "").lower(),
+            str(ch.get("h2") or "").lower()
+        }:
+            ch["_score"] = 1.0; return ch
+    return None
+
+# === UX-утилиты ===
+# quick_refs — только suggest_refs; фильтруем самоссылку по текущему H2/H3
+def _build_quick_refs(meta: dict, md_file: str, current_h2_id: str, current_h3_id: str):
+    out = []
+    cur_anchor = (current_h3_id or current_h2_id or "overview")
+    cur_ref = f"{os.path.basename(md_file or '')}#{cur_anchor}".lower() if md_file else None
+    for r in (meta.get("suggest_refs") or []):
+        if isinstance(r, str):
+            ref = r if "#" in r else None
+            label = r.split("#",1)[0] if ref else None
+        else:
+            ref = r.get("ref"); label = r.get("label") or (ref.split("#",1)[0] if ref else None)
+        if not (label and ref): continue
+        if cur_ref and ref.lower() == cur_ref:  # самоссылку выкидываем
+            continue
+        out.append({"label": label, "ref": ref})
+    return out
+
+# followups — из suggest_h3 (id внутренних секций этого же файла),
+# исключаем текущий H2/H3 (если совпало), label берём из заголовка
+def _build_followups(meta: dict, md_file: str, current_h2_id: str, current_h3_id: str):
+    out = []
+    for s in (meta.get("suggest_h3") or []):
+        h_id = s if isinstance(s, str) else (s.get("h3_id") or s.get("id"))
+        if not h_id: continue
+        if str(h_id).lower() in { str(current_h2_id or '').lower(), str(current_h3_id or '').lower() }:
+            continue
+        label = _heading_label(md_file, h_id) if '_heading_label' in globals() else (str(h_id).replace('-',' ').capitalize())
+        out.append({"label": label, "ref": f"{os.path.basename(md_file)}#{h_id}"})
+    return out
+
+def _build_cta(meta: dict):
+    if meta.get("cta_text") and meta.get("cta_action"):
+        return {"text": meta["cta_text"], "action": meta["cta_action"]}
+    return None
+
+# Заглушка оффера (можно оставить None; офферы прикрутим позже)
+def _pick_relevant_offer(meta: dict):
+    return None
 
 # === Разбор секций в .md и кэш индекса по файлам ===
 _RE_H2 = re.compile(r"^##\s+.*?\{#([a-z0-9\-]+)\}\s*$", re.I | re.M)
@@ -148,10 +287,20 @@ EMB_MODEL = os.getenv("MODEL_EMBED","text-embedding-3-small")
 CHAT_MODEL= os.getenv("MODEL_CHAT","gpt-4o-mini")
 PORT      = int(os.getenv("PORT", "9000"))
 
-# загрузка индекса
-CORPUS = [json.loads(x) for x in open("data/corpus.jsonl", encoding="utf-8")]
+# загрузка индекса (ленивая)
+_CORPUS = None
+
+def _load_corpus_if_needed():
+    global _CORPUS
+    if _CORPUS is None:
+        try:
+            with open(os.path.join("data","corpus.jsonl"), "r", encoding="utf-8") as f:
+                _CORPUS = [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            _CORPUS = []
+    return _CORPUS
+
 EMB    = np.load("data/embeddings.npy")  # уже нормализованы
-assert EMB.shape[0] == len(CORPUS)
 
 def _chunk_info(ch, sc=None):
     """
@@ -233,8 +382,9 @@ def retrieve(q:str, topk:int=4):
     idx = np.argsort(-sims)[:max(topk,8)]  # возьмём немного с запасом
     # дедуп по (file,h2_id,h3_id)
     seen, out = set(), []
+    corpus = _load_corpus_if_needed()
     for i in idx:
-        c = CORPUS[int(i)]
+        c = corpus[int(i)]
         key = (c["file"], c.get("h2_id") or c.get("h2"), c.get("h3_id") or c.get("h3"))
         if key in seen: continue
         seen.add(key); c2 = dict(c); c2["_score"]=float(sims[int(i)])
@@ -328,101 +478,280 @@ def debug_ping():
 
 @app.post("/ask")
 def ask():
-    data = request.get_json(force=True)
-    q = (data.get("q") or "").strip()
-    if not q: return jsonify({"answer":"Уточните вопрос."})
-    
-    # Безопасное логирование запроса (без секретов)
-    log_json(logger, "Processing question", question=q[:100], question_length=len(q))
-    
-    cands = retrieve(q, topk=3)
-    if not cands:
-        log_json(logger, "No candidates found", question=q[:50])
-        return jsonify({"answer":"Пока не нашёл подходящий ответ. Сформулируйте вопрос иначе."})
-    
-    # Приоритетный выбор для контактных запросов
-    is_contacts_intent = bool(CONTACTS_RE.search(q or ""))
-    if is_contacts_intent:
-        picked = None
-        for it in cands:
-            dt = (_doc_type_of(it) or "")
-            if dt.lower() == "contacts":
-                picked = it
-                break
-        if picked is not None:
-            # нормализуем к (final_chunk, final_score)
-            try:
-                final_chunk, final_score = picked
-            except Exception:
-                final_chunk, final_score = picked, _score_of(picked)
-            use_rerank = False
-            top_score = _score_of(cands[0]) if cands else None
-            log_json(logger, "selection",
-                     question=q[:200],
-                     original_top_score=(round(float(top_score), 4) if top_score is not None else None),
-                     rerank_applied=False,
-                     chosen=_chunk_info(final_chunk, final_score))
-            
-            # Генерация ответа для контактного запроса
-            answer = compose_answer(q, final_chunk)
-            log_json(logger, "Answer generated", 
-                     file=final_chunk["file"], score=round(final_score,3), answer_length=len(answer))
-            
-            return jsonify({
-                "answer": answer,
-                "meta": {
-                    "file": final_chunk["file"], "h2": final_chunk["h2"], "h3": final_chunk["h3"], "score": round(final_score,3),
-                    "followups": final_chunk.get("followups", [])[:2]
-                }
-            })
-    
-    # Приоритетный выбор для ценовых запросов
-    is_price_intent = bool(PRICES_RE.search(q or ""))
-    if is_price_intent:
-        picked = next((it for it in cands if (_doc_type_of(it) or "").lower() == "prices"), None)
-        if picked is not None:
-            try:
-                final_chunk, final_score = picked
-            except Exception:
-                final_chunk, final_score = picked, _score_of(picked)
-            log_json(logger, "selection",
-                     question=q[:200],
-                     original_top_score=(round(float(_score_of(cands[0])),4) if cands else None),
-                     rerank_applied=False,
-                     chosen=_chunk_info(final_chunk, final_score))
-            answer = compose_answer(q, final_chunk)
-            log_json(logger, "Answer generated", file=final_chunk["file"], score=round(final_score,3), answer_length=len(answer))
-            return jsonify({"answer": answer, "meta": {"file": final_chunk["file"], "h2": final_chunk["h2"], "h3": final_chunk["h3"], "score": round(final_score,3), "followups": final_chunk.get("followups", [])[:2]}})
-    
-    top = cands[0]
-    best = float(top["_score"])
+    try:
+        data = request.get_json(force=True) or {}
+        q = (data.get("q") or "").strip()
+        ref = (data.get("ref") or "").strip()
+        
+        # Если есть ref - попробуем найти чанк по ссылке
+        if ref:
+            ch = get_chunk_by_ref(ref)
+            if ch:
+                top = ch
+                # Генерируем ответ для найденного чанка
+                answer = compose_answer(q or f"Информация из {ref}", top)
+                
+                # Фолбэк для пустого ответа
+                if not isinstance(answer, str) or not answer.strip():
+                    fallback = (top.get("text") or "").strip()
+                    answer = (fallback[:800] + ("…" if len(fallback) > 800 else "")) or \
+                             "Пока не нашёл точный ответ. Можете уточнить вопрос?"
+                
+                # Логирование результата
+                log_json(logger, "Answer generated from ref", 
+                         file=top.get("file"), score=round(float(top.get("_score",0.0)),3), answer_length=len(answer))
+                
+                # Сборка UX-данных
+                md_file = top.get("file")
+                h2_id, h3_id = _get_ids(top)
+                h2_val = top.get("h2") or top.get("h2_id")
+                h3_val = top.get("h3") or top.get("h3_id")
+                is_overview = _is_overview_by_ids(h2_id, h3_id)
 
-    # если уверенность средняя — дёрнем лёгкий реранк
-    use_rerank = 0.45 <= best <= 0.62 and len(cands) >= 2
-    if use_rerank:
-        log_json(logger, "Applying rerank", original_score=best, candidates_count=len(cands))
-        top = llm_rerank(q, cands[:3])
-    
-    # Логирование выбора финального кандидата
-    log_json(logger, "selection",
-             question=q[:200],
-             original_top_score=(round(float(best), 4) if best is not None else None),
-             rerank_applied=bool(use_rerank),
-             chosen=_chunk_info(top, top.get("_score") if isinstance(top, dict) else None))
-    
-    answer = compose_answer(q, top)  # если хочешь без LLM — просто answer = top["text"]
-    
-    # Логирование результата
-    log_json(logger, "Answer generated", 
-             file=top["file"], score=round(top["_score"],3), answer_length=len(answer))
-    
-    return jsonify({
-        "answer": answer,
-        "meta": {
-            "file": top["file"], "h2": top["h2"], "h3": top["h3"], "score": round(top["_score"],3),
-            "followups": top.get("followups", [])[:2]
-        }
-    })
+                meta_doc = get_doc_meta(os.path.basename(md_file or "")) or {}
+
+                quick_refs = _build_quick_refs(meta_doc, md_file, h2_id, h3_id)
+                fups_full  = _build_followups(meta_doc, md_file, h2_id, h3_id)
+
+                # показываем followups только на overview и максимум 1
+                followups = fups_full[:1] if is_overview else []
+
+                score = float(round(float(top.get("_score", 0.0)), 3))
+
+                payload = {
+                    "answer": answer,
+                    "quick_replies": quick_refs,   # только suggest_refs
+                    "cta": _build_cta(meta_doc),
+                    "offer": _pick_relevant_offer(meta_doc),
+                    "meta": {
+                        "file": md_file,
+                        "h2": h2_val, "h3": h3_val,   # для читаемости
+                        "h2_id": h2_id, "h3_id": h3_id,  # для стабильной логики
+                        "score": score,
+                        "followups": followups,
+                        "is_overview": bool(is_overview),
+                        "cta_mode": meta_doc.get("cta_mode"),
+                        "tags": (list(meta_doc.get("tags")) if isinstance(meta_doc.get("tags"), set) else (meta_doc.get("tags") or []))
+                    }
+                }
+
+                return safe_jsonify(payload)
+        
+        if not q: 
+            return safe_jsonify({
+                "answer": "Уточните вопрос.",
+                "quick_replies": [], "cta": None, "offer": None, 
+                "meta": {"error": "empty_question"}
+            })
+        
+        # Безопасное логирование запроса (без секретов)
+        log_json(logger, "Processing question", question=q[:100], question_length=len(q))
+        
+        cands = retrieve(q, topk=3)
+        if not cands:
+            log_json(logger, "No candidates found", question=q[:50])
+            return safe_jsonify({
+                "answer": "Пока не нашёл подходящий материал в базе. Сформулируйте вопрос иначе или выберите один из вариантов ниже.",
+                "quick_replies": [], "cta": None, "offer": None, 
+                "meta": {"file": None}
+            })
+        
+        # Приоритетный выбор для контактных запросов
+        is_contacts_intent = bool(CONTACTS_RE.search(q or ""))
+        if is_contacts_intent:
+            picked = None
+            for it in cands:
+                dt = (_doc_type_of(it) or "")
+                if dt.lower() == "contacts":
+                    picked = it
+                    break
+            if picked is not None:
+                # нормализуем к (final_chunk, final_score)
+                try:
+                    final_chunk, final_score = picked
+                except Exception:
+                    final_chunk, final_score = picked, _score_of(picked)
+                use_rerank = False
+                top_score = _score_of(cands[0]) if cands else None
+                log_json(logger, "selection",
+                         question=q[:200],
+                         original_top_score=(round(float(top_score), 4) if top_score is not None else None),
+                         rerank_applied=False,
+                         chosen=_chunk_info(final_chunk, final_score))
+                
+                # Генерация ответа для контактного запроса
+                answer = compose_answer(q, final_chunk)
+                
+                # Фолбэк для пустого ответа
+                if not isinstance(answer, str) or not answer.strip():
+                    fallback = (final_chunk.get("text") or "").strip()
+                    answer = (fallback[:800] + ("…" if len(fallback) > 800 else "")) or \
+                             "Пока не нашёл точный ответ. Можете уточнить вопрос?"
+                
+                log_json(logger, "Answer generated", 
+                         file=final_chunk["file"], score=round(float(final_score),3), answer_length=len(answer))
+                
+                # Сборка UX-данных
+                meta = get_doc_meta(os.path.basename(final_chunk.get("file",""))) or {}
+                md_file = final_chunk.get("file")
+                h2_id, h3_id = _get_ids(final_chunk)
+                h2_val = final_chunk.get("h2") or final_chunk.get("h2_id")
+                h3_val = final_chunk.get("h3") or final_chunk.get("h3_id")
+                is_overview = _is_overview_by_ids(h2_id, h3_id)
+
+                quick_refs = _build_quick_refs(meta, md_file, h2_id, h3_id)
+                fups_full  = _build_followups(meta, md_file, h2_id, h3_id)
+
+                # показываем followups только на overview и максимум 1
+                followups = fups_full[:1] if is_overview else []
+                
+                # score всегда приводим к float
+                score = float(round(float(final_score), 3))
+                
+                return safe_jsonify({
+                    "answer": answer,
+                    "quick_replies": quick_refs,   # только suggest_refs
+                    "cta": _build_cta(meta),
+                    "offer": _pick_relevant_offer(meta),
+                    "meta": {
+                        "file": final_chunk.get("file"),
+                        "h2": h2_val, "h3": h3_val,   # для читаемости
+                        "h2_id": h2_id, "h3_id": h3_id,  # для стабильной логики
+                        "score": score,
+                        "followups": followups,
+                        "is_overview": bool(is_overview),
+                        "cta_mode": meta.get("cta_mode"),
+                        "tags": (list(meta.get("tags")) if isinstance(meta.get("tags"), set) else (meta.get("tags") or []))
+                    }
+                })
+        
+        # Приоритетный выбор для ценовых запросов
+        is_price_intent = bool(PRICES_RE.search(q or ""))
+        if is_price_intent:
+            picked = next((it for it in cands if (_doc_type_of(it) or "").lower() == "prices"), None)
+            if picked is not None:
+                try:
+                    final_chunk, final_score = picked
+                except Exception:
+                    final_chunk, final_score = picked, _score_of(picked)
+                log_json(logger, "selection",
+                         question=q[:200],
+                         original_top_score=(round(float(_score_of(cands[0])),4) if cands else None),
+                         rerank_applied=False,
+                         chosen=_chunk_info(final_chunk, final_score))
+                answer = compose_answer(q, final_chunk)
+                
+                # Фолбэк для пустого ответа
+                if not isinstance(answer, str) or not answer.strip():
+                    fallback = (final_chunk.get("text") or "").strip()
+                    answer = (fallback[:800] + ("…" if len(fallback) > 800 else "")) or \
+                             "Пока не нашёл точный ответ. Можете уточнить вопрос?"
+                
+                log_json(logger, "Answer generated", file=final_chunk["file"], score=round(float(final_score),3), answer_length=len(answer))
+                
+                # Сборка UX-данных
+                meta = get_doc_meta(os.path.basename(final_chunk.get("file",""))) or {}
+                md_file = final_chunk.get("file")
+                h2_id, h3_id = _get_ids(final_chunk)
+                h2_val = final_chunk.get("h2") or final_chunk.get("h2_id")
+                h3_val = final_chunk.get("h3") or final_chunk.get("h3_id")
+                is_overview = _is_overview_by_ids(h2_id, h3_id)
+
+                quick_refs = _build_quick_refs(meta, md_file, h2_id, h3_id)
+                fups_full  = _build_followups(meta, md_file, h2_id, h3_id)
+
+                # показываем followups только на overview и максимум 1
+                followups = fups_full[:1] if is_overview else []
+                
+                # score всегда приводим к float
+                score = float(round(float(final_score), 3))
+                
+                return safe_jsonify({
+                    "answer": answer,
+                    "quick_replies": quick_refs,   # только suggest_refs
+                    "cta": _build_cta(meta),
+                    "offer": _pick_relevant_offer(meta),
+                    "meta": {
+                        "file": final_chunk.get("file"),
+                        "h2": h2_val, "h3": h3_val,   # для читаемости
+                        "h2_id": h2_id, "h3_id": h3_id,  # для стабильной логики
+                        "score": score,
+                        "followups": followups,
+                        "is_overview": bool(is_overview),
+                        "cta_mode": meta.get("cta_mode"),
+                        "tags": (list(meta.get("tags")) if isinstance(meta.get("tags"), set) else (meta.get("tags") or []))
+                    }
+                })
+        
+        top = cands[0]
+        best = float(top["_score"])
+
+        # если уверенность средняя — дёрнем лёгкий реранк
+        use_rerank = 0.45 <= best <= 0.62 and len(cands) >= 2
+        if use_rerank:
+            log_json(logger, "Applying rerank", original_score=best, candidates_count=len(cands))
+            top = llm_rerank(q, cands[:3])
+        
+        # Логирование выбора финального кандидата
+        log_json(logger, "selection",
+                 question=q[:200],
+                 original_top_score=(round(float(best), 4) if best is not None else None),
+                 rerank_applied=bool(use_rerank),
+                 chosen=_chunk_info(top, top.get("_score") if isinstance(top, dict) else None))
+        
+        answer = compose_answer(q, top)  # если хочешь без LLM — просто answer = top["text"]
+        
+        # Фолбэк для пустого ответа
+        if not isinstance(answer, str) or not answer.strip():
+            fallback = (top.get("text") or "").strip()
+            answer = (fallback[:800] + ("…" if len(fallback) > 800 else "")) or \
+                     "Пока не нашёл точный ответ. Можете уточнить вопрос?"
+        
+        # Логирование результата
+        log_json(logger, "Answer generated", 
+                 file=top["file"], score=round(float(top.get("_score",0.0)),3), answer_length=len(answer))
+        
+        # Сборка UX-данных
+        meta = get_doc_meta(os.path.basename(top.get("file",""))) or {}
+        md_file = top.get("file")
+        h2_id, h3_id = _get_ids(top)
+        h2_val = top.get("h2") or top.get("h2_id")
+        h3_val = top.get("h3") or top.get("h3_id")
+        is_overview = _is_overview_by_ids(h2_id, h3_id)
+
+        quick_refs = _build_quick_refs(meta, md_file, h2_id, h3_id)
+        fups_full  = _build_followups(meta, md_file, h2_id, h3_id)
+
+        # показываем followups только на overview и максимум 1
+        followups = fups_full[:1] if is_overview else []
+        
+        # score всегда приводим к float
+        score = float(round(float(top.get("_score", 0.0)), 3))
+        
+        return safe_jsonify({
+            "answer": answer,
+            "quick_replies": quick_refs,   # только suggest_refs
+            "cta": _build_cta(meta),
+            "offer": _pick_relevant_offer(meta),
+            "meta": {
+                "file": top.get("file"),
+                "h2": h2_val, "h3": h3_val,
+                "h2_id": h2_id, "h3_id": h3_id,
+                "score": score,
+                "followups": followups,
+                "is_overview": bool(is_overview),
+                "cta_mode": meta.get("cta_mode"),
+                "tags": (list(meta.get("tags")) if isinstance(meta.get("tags"), set) else (meta.get("tags") or []))
+            }
+        })
+        
+    except Exception as e:
+        logger.exception("ask_failed", extra={"q": q, "err": str(e)})
+        return safe_jsonify({
+            "answer": "Извините, не получилось ответить. Попробуйте переформулировать вопрос.",
+            "quick_replies": [], "cta": None, "offer": None, 
+            "meta": {"error": "internal"}
+        }), 200
 
 # отладка: смотреть кандидатов
 @app.get("/__debug/retrieval")
@@ -436,6 +765,32 @@ def dbg():
 @app.get("/static/<path:path>")
 def static_files(path):
     return send_from_directory("static", path)
+
+# эндпоинт приёма заявок
+@app.post("/lead")
+def create_lead():
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"ok": False, "error": "bad_json"}), 400
+
+    name  = (data.get("name") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    intent = (data.get("intent") or "").strip()
+
+    # Мини-валидация
+    if not phone or len(phone) < 6:
+        return jsonify({"ok": False, "error": "invalid_phone"}), 400
+
+    os.makedirs("leads", exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")  # без двоеточий
+    fname = f"{ts}_{uuid4().hex[:6]}.json"               # небольшой уникальный хвост
+    rec = {"ts": ts, "name": name, "phone": phone, "intent": intent}
+
+    with open(os.path.join("leads", fname), "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=PORT, debug=True)

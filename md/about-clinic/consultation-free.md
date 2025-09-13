@@ -17,7 +17,6 @@ cta_text: "Записаться на бесплатную консультаци
 cta_action: "consultation"
 suggest_h3:
   - "dlitelnost"
-  - "kt"
 updated: "2025-09-12"
 ---
 
