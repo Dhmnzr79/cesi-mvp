@@ -1,9 +1,18 @@
 import os, json, re, glob, numpy as np, frontmatter
 from dotenv import load_dotenv
 from openai import OpenAI
+from logging_setup import log_json, setup_logging
 
 load_dotenv()
-client = OpenAI()
+
+# Настройка логирования
+logger = setup_logging()
+
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is not set in .env")
+
+client = OpenAI(api_key=api_key)
 EMB_MODEL = os.getenv("MODEL_EMBED", "text-embedding-3-small")
 
 ALIAS_RX = re.compile(r"<!--\s*aliases:\s*\[(.*?)\]\s*-->", re.I|re.S)
@@ -43,6 +52,7 @@ def embed_batch(texts):
     return [np.array(d.embedding, dtype=np.float32) for d in resp.data]
 
 def main():
+    log_json(logger, "Starting index build")
     os.makedirs("data", exist_ok=True)
     corpus, embeds = [], []
     for path in glob.glob("md/**/*.md", recursive=True):
@@ -98,6 +108,9 @@ def main():
     np.save("data/embeddings.npy", arr)
     with open("data/corpus.jsonl","w",encoding="utf-8") as f:
         for row in corpus: f.write(json.dumps(row, ensure_ascii=False)+"\n")
+    
+    log_json(logger, "Index build completed", 
+             chunks_count=len(corpus), embeddings_shape=arr.shape)
     print(f"OK: chunks={len(corpus)}  -> data/embeddings.npy, data/corpus.jsonl")
 
 if __name__ == "__main__":
