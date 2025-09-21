@@ -21,9 +21,20 @@
   <button id="send">Отправить</button>
 </div>
 <script>
+  const SID_KEY = 'bot_sid';
+  function ensureSID(){
+    let s = localStorage.getItem(SID_KEY);
+    if (!s){
+      s = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(16).slice(2));
+      localStorage.setItem(SID_KEY, s);
+    }
+    return s;
+  }
+  const SID = ensureSID();
+
 const log = document.getElementById('log');
 const q = document.getElementById('q');
-const sid = 'local-' + Math.random().toString(36).slice(2);
+const sid = SID;
 
 // === Стейт для сбора заявки ===
 let leadState = null; // null | 'need_name' | 'need_phone'
@@ -366,15 +377,16 @@ function renderAnswerBlock(data, rawText){
   const lastMsgEl = log && log.lastElementChild;
   if (lastMsgEl && data) renderUx(lastMsgEl, data);
   if (lastMsgEl && data && data.cta) maybeRenderCta(lastMsgEl, data, '');
+  if (lastMsgEl && data) renderMemoryButton(lastMsgEl, data);
 }
 
 async function ask(text) {
   let raw = ''; let data = null; let ok = false;
   try {
-    const r = await fetch('/ask', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ q: text })
+  const r = await fetch('/ask', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ q: text, sid: SID })
     });
     raw = await r.text();
     try { data = JSON.parse(raw); ok = r.ok; } catch(e){ data = null; }
@@ -490,9 +502,9 @@ async function sendRef(ref){
     const r = await fetch('/ask', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ ref })
+      body: JSON.stringify({ ref, sid: SID })
     });
-    const raw = await r.text();
+  const raw = await r.text();
     let data = null;
     try { data = JSON.parse(raw); } catch(e){ data = { answer: '(ошибка парсинга JSON)', meta:{}, raw }; }
     renderAnswerBlock(data, raw);
@@ -597,6 +609,26 @@ async function sendQuestion(text) {
     const lastMsgEl = log.lastElementChild; // последний добавленный элемент
     maybeRenderCta(lastMsgEl, resp, q);
   }
+}
+
+function renderMemoryButton(containerEl, resp){
+  const sid = (resp.meta && resp.meta.sid) || null;
+  if (!sid) return;
+  const btn = document.createElement('a');
+  btn.href = '#'; btn.style.marginLeft = '12px';
+  btn.textContent = 'Память';
+  btn.onclick = async (e)=>{
+    e.preventDefault();
+    try{
+      const r = await fetch(`/static/sessions/${sid}.json`);
+      const t = await r.text();
+      const pre = document.createElement('pre');
+      pre.textContent = t;
+      containerEl.appendChild(pre);
+    }catch(e){}
+  };
+  const links = containerEl.querySelector('div a');
+  if (links && links.parentNode) links.parentNode.appendChild(btn);
 }
 
 document.getElementById('send').onclick = () => {

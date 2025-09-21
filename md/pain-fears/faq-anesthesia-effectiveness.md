@@ -1,25 +1,26 @@
 ---
 title: "А вдруг анестезия не подействует?"
-doc_id: "faq-anesthesia-effectiveness"
 doc_type: "safety"
 topic: "safety"
-verbatim: false
-empathy_enabled: true
-empathy_tag: "fear_pain"
 aliases:
   - "анестезия не подействует"
   - "боюсь что анестезия не возьмет"
   - "обезболивание не работает"
   - "не берет заморозка"
   - "страх анестезии"
+verbatim: false
+empathy_enabled: true
+empathy_tag: "fear_pain"
 preferred_format: ["detailed","bullets"]
-cta_action: "consultation"
 cta_text: "Обсудить варианты обезболивания"
-updated: "2025-09-03"
+cta_action: "consultation"
+suggest_refs:
+  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
+  - { label: "Противопоказания", ref: "implants-contraindications.md#overview" }
+updated: "2025-09-20"
 ---
 
-## Анастезия
+## Анестезия {#overview}
 - Никакой «заморозки» на пол-лица и потери контроля — только прицельное обезболивание  
 - Врач всегда убеждается, что вы не чувствуете боли, прежде чем начать  
-- Подбираем вид анестезии индивидуально
-
+- Подбираем вид анестезии индивидуально  
