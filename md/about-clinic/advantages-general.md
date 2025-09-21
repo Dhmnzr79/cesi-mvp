@@ -16,7 +16,6 @@ cta_action: "consultation"
 preferred_format: ["short","bullets"]
 suggest_refs:
   - { label: "Наши технологии", ref: "clinic-tech.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Адрес и контакты", ref: "clinic-contacts.md#overview" }
 updated: "2025-09-12"
 ---

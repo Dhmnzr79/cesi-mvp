@@ -16,7 +16,6 @@ cta_text: "Познакомиться с врачом на консультац�
 cta_action: "consultation"
 suggest_refs:
   - { label: "Все врачи",                ref: "doctors.md#overview" }
-  - { label: "Бесплатная консультация",  ref: "consultation-free.md#overview" }
   - { label: "Адрес и контакты",         ref: "clinic-contacts.md#overview" }
 updated: "2025-09-12"
 ---

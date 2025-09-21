@@ -17,7 +17,6 @@ suggest_h3:
   - "komu-podhodit"
   - "stoimost"
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Наши технологии", ref: "clinic-tech.md#overview" }
 updated: "2025-09-20"
 ---

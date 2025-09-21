@@ -18,7 +18,6 @@ cta_text: "Обсудить способы обезболивания"
 cta_action: "consultation"
 suggest_refs:
   - { label: "А вдруг анестезия не подействует?", ref: "faq-anesthesia-effectiveness.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 

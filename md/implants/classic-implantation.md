@@ -18,7 +18,6 @@ suggest_h3:
   - "uchityvat"
 suggest_refs:
   - { label: "Одномоментная имплантация", ref: "one-stage-implantation.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 

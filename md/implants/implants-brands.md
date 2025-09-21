@@ -20,7 +20,6 @@ suggest_h3:
   - "impro"
   - "implantium"
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Наши технологии", ref: "clinic-tech.md#overview" }
 updated: "2025-09-20"
 ---

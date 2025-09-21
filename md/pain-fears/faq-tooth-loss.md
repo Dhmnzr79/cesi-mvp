@@ -16,7 +16,6 @@ cta_text: "Записаться на консультацию"
 cta_action: "consultation"
 suggest_refs:
   - { label: "Костная пластика", ref: "bone-graft.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 

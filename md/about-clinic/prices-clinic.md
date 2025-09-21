@@ -17,7 +17,6 @@ cta_action: "consultation"
 # Одно сообщение: кнопки только на внешние разделы
 suggest_refs:
   - { label: "КТ: стоимость и показания", ref: "tomography.md#overview" }
-  - { label: "Бесплатная консультация",   ref: "consultation-free.md#overview" }
   - { label: "Адрес и контакты",          ref: "clinic-contacts.md#overview" }
 updated: "2025-09-12"
 ---

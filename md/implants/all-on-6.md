@@ -19,7 +19,6 @@ suggest_h3:
   - "komu-podhodit"
 suggest_refs:
   - { label: "All-on-4", ref: "all-on-4.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 

@@ -17,7 +17,6 @@ cta_text: "Записаться на консультацию"
 cta_action: "consultation"
 suggest_refs:
   - { label: "Виды имплантов", ref: "implants-brands.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 

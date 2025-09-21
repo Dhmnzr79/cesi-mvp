@@ -17,7 +17,6 @@ suggest_h3:
   - "risk"
 suggest_refs:
   - { label: "Противопоказания", ref: "implants-contraindications.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 

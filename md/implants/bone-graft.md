@@ -17,7 +17,6 @@ cta_action: "consultation"
 suggest_h3:
   - "kak-vypolnyaem"
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "All-on-4", ref: "all-on-4.md#overview" }
 updated: "2025-09-20"
 ---

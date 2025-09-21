@@ -15,7 +15,6 @@ preferred_format: ["detailed","bullets"]
 cta_text: "Обсудить варианты обезболивания"
 cta_action: "consultation"
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Противопоказания", ref: "implants-contraindications.md#overview" }
 updated: "2025-09-20"
 ---

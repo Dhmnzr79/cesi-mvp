@@ -15,33 +15,8 @@ logger = get_logger("bot")
 DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "dev-debug")
 
 # === Память сессий ===
-SESS_DIR = Path("data/sessions")
-SESS_DIR.mkdir(parents=True, exist_ok=True)
-MAX_HISTORY = 12   # сколько хранить в памяти
-CTX_TURNS   = 4    # сколько последних реплик подмешивать в промпт
-
 CONTACTS_RE = re.compile(r"(адрес|где.*находитесь|как\s+(доехать|проехать)|время\s+работы|график|телефон|whatsapp|карта|расположение)", re.I)
 PRICES_RE = re.compile(r"(цена|стоимост|сколько\s+стоит|прайс|расценк|по\s+цене|сколько\s+будет|сколько\s+руб)", re.I)
-
-# Вопрос про имя
-NAME_Q_RE = re.compile(r"(как\s+меня\s+зовут|мо[её]?\s+имя|как\s+к\s+вам\s+обращаться)", re.I)
-
-# Токен имени: Денис / Anna / Жан-Клод
-NAME_TOKEN = r"[A-Za-zА-ЯЁ][A-Za-zА-ЯЁ\-]{1,30}"
-
-# Явное называние имени. ВАЖНО: строгие границы слова, чтобы 'я' не матчился внутри "Меня"
-NAME_SET_RE = re.compile(
-    rf"(?:\bменя\s+зовут\b|\bменя\s+звать\b|\b(?:я|это)\b)\s+({NAME_TOKEN})(?=[\s,.!?]|$)",
-    re.I
-)
-
-# Имя может оказаться в приветствии ассистента: "Привет, Денис!"
-NAME_IN_ASSIST_RE = re.compile(rf"(?:привет|здравствуйте)[,!\s]+({NAME_TOKEN})(?=[\s,.!?]|$)", re.I)
-
-# Память страхов
-FEAR_RX     = re.compile(r"\b(боюсь|страшно|переживаю|волнуюсь|тревожно)\b", re.I)
-FEAR_OF_RX  = re.compile(r"(?:боюсь|страшно|переживаю|волнуюсь)\s+(?:что|за|делать|из-за)?\s*([^.!?\n]{2,60})", re.I)
-FEAR_Q_RE   = re.compile(r"^(?:а\s+)?чего\s+я\s+боюсь\??$", re.I)
 
 # ---- JSON sanitize helpers ----
 def _to_plain(o):
@@ -180,272 +155,197 @@ def _build_cta(meta: dict):
 def _pick_relevant_offer(meta: dict):
     return None
 
-# === Эмпатия ===
-EMPATY_COOLDOWN_TURNS = 4  # не чаще чем раз в 4 хода
+def _dedup_refs_vs_cta(quick_refs, cta_btn):
+    """Убирает внешние ссылки, дублирующие CTA по label."""
+    if not cta_btn or not quick_refs: 
+        return quick_refs
+    cta_label = (cta_btn.get("text") or "").strip().lower()
+    out = []
+    seen = set()
+    for r in quick_refs:
+        lbl = (r.get("label") or "").strip().lower()
+        if not lbl: 
+            continue
+        # убираем точный дубль CTA
+        if lbl == cta_label: 
+            continue
+        if lbl not in seen:
+            out.append(r); seen.add(lbl)
+    return out
 
-PAIN_RX   = re.compile(r"\b(болит|больно|терпеть|ноет|пульсиру|кровоточ|воспален|страшно|боюсь|переживаю)\b", re.I)
-PRICE_RX  = re.compile(r"\b(цена|стоимост|дорог|сколько\s+стоит|бюджет|расценк|прайс)\b", re.I)
-TIME_RX   = re.compile(r"\b(сколько\s+(длится|времени)|долго|быстро|успею|времени\s+нет)\b", re.I)
-WARR_RX   = re.compile(r"\b(гаранти|передела|не\s*прижился|сломал|поломк)\b", re.I)
+# === EMPATHY CONFIG (MVP) =========================================
+EMPATHY_ON = True  # общий рубильник; выключи, если надо
+# лёгкие триггеры по намерениям (НЕ тексты эмпатии!)
+TRIGGERS = {
+    "fear_pain": r"(боюс|страшн|тревог|паник|боль|болит|болезнен|анестез|заморозк|укол)",
+    "safety":    r"(опасн|зараж|инфекц|стерил|безопасн|чистот|противопоказан|риск)",
+    "price":     r"(дорог|дешев|стоимост|цена|сколько стоит|рассрочк)",
+    "timing":    r"(сколько времен|как долго|срок|долго|за один день|быстрее)",
+    "indications": r"(подходит ли|можно ли мне|мой случай|показан|показания)",
+    "support":   r"(пережив|сомнева|не уверен|не уверена|тяну ли|поможете|помогите)",
+}
 
-def _last_turn(session):
-    try:
-        return int(session.get("turn", 0))
-    except Exception:
-        return 0
+TRIGGERS_COMPILED = {k: re.compile(v, re.I | re.U) for k, v in TRIGGERS.items()}
 
-def should_add_empathy(q: str, meta: dict, session: dict):
+# простейшее хранилище состояния сессии (замени на своё)
+SESSION_STATE = {}  # key: session_id -> {"last_doc_key": "...", "last_empathy_at": iso, ...}
+
+def _norm(text: str) -> str:
+    return (text or "").lower().replace("ё", "е").strip()
+
+def _doc_key(md_file: str, meta: dict) -> str:
+    # используем путь файла как устойчивый ключ темы
+    return meta.get("doc_id") or md_file  # doc_id если есть; иначе имя файла
+
+def _is_first_in_topic(session_id: str, doc_key: str) -> bool:
+    st = SESSION_STATE.get(session_id) or {}
+    return st.get("last_doc_key") != doc_key
+
+def _is_emotional(user_q: str, empathy_tag: str | None) -> bool:
+    q = _norm(user_q)
+    # если указан тег — сначала проверим его группу
+    if empathy_tag and empathy_tag in TRIGGERS_COMPILED:
+        if TRIGGERS_COMPILED[empathy_tag].search(q):
+            return True
+    # иначе — проверим все группы
+    for rx in TRIGGERS_COMPILED.values():
+        if rx.search(q):
+            return True
+    return False
+
+def _update_session(session_id: str, doc_key: str, empathy_used: bool):
+    st = SESSION_STATE.setdefault(session_id, {})
+    st["last_doc_key"] = doc_key
+    if empathy_used:
+        st["last_empathy_at"] = datetime.utcnow().isoformat()
+
+# Системный промпт (динамическая эмпатия)
+BASE_SYSTEM = (
+    "Ты — спокойный и доброжелательный врач-имплантолог. "
+    "Отвечай кратко, точно и только по предоставленному контенту. "
+    "Если информации нет — мягко скажи об этом и предложи консультацию."
+)
+
+EMPATHY_ADDON = (
+    " Добавь 1 короткое предложение эмпатии в начале или конце ответа, "
+    "строго по тону вопроса пациента (страх/боль, безопасность, стоимость, сроки, подходит ли). "
+    "Эмпатия должна быть естественной, без клише и без повторения фактов. "
+    "После неё дай точный ответ по контенту."
+)
+
+def build_messages_for_gpt(user_q: str, context_md: str, meta: dict, session_id: str):
     """
-    Возвращает (need_empathy: bool, intent: str).
-    intent ∈ {'pain','price','time','warranty','generic'}
+    user_q     — вопрос пользователя (string)
+    context_md — подобранные чанки из md (string)
+    meta       — фронт-маттер выбранного файла (dict), уже есть empathy_enabled/empathy_tag
+    session_id — id сессии (string)
     """
-    # кулдаун по ходам
-    last_emp_at = int(session.get("last_empathy_turn", -999))
-    turn = _last_turn(session) + 1
-    session["turn"] = turn
-    if turn - last_emp_at < EMPATY_COOLDOWN_TURNS:
-        return (False, None)
+    # Решаем: добавлять ли эмпатию в этот ответ
+    doc_key = _doc_key(meta.get("md_file") or meta.get("source") or meta.get("title", ""), meta)
+    allow_empathy = bool(EMPATHY_ON and meta.get("empathy_enabled"))
+    first_in_topic = _is_first_in_topic(session_id, doc_key)
+    emotional = _is_emotional(user_q, meta.get("empathy_tag"))
 
-    q_l = (q or "").lower()
+    use_empathy = bool(allow_empathy and (first_in_topic or emotional))
 
-    # если явно включили эмпатию в шапке — подумаем об общей фразе
-    if meta.get("empathy_enabled"):
-        intent = 'generic'
-        # но если видим явный триггер — уточняем
-        if PAIN_RX.search(q_l):   intent = 'pain'
-        elif PRICE_RX.search(q_l): intent = 'price'
-        elif TIME_RX.search(q_l):  intent = 'time'
-        elif WARR_RX.search(q_l):  intent = 'warranty'
-        return (True, intent)
+    system_prompt = BASE_SYSTEM + (EMPATHY_ADDON if use_empathy else "")
 
-    # без флага — только при явных триггерах
-    if PAIN_RX.search(q_l):   return (True, 'pain')
-    if PRICE_RX.search(q_l):  return (True, 'price')
-    if TIME_RX.search(q_l):   return (True, 'time')
-    if WARR_RX.search(q_l):   return (True, 'warranty')
+    # Собираем сообщения
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": (
+            "Вопрос пациента:\n" + user_q.strip() +
+            "\n\nКонтент для ответа (markdown, цитируй по смыслу, не выдумывай):\n" + context_md.strip()
+        )},
+    ]
 
-    return (False, None)
+    # сохраним решение для логов/UI
+    meta["_empathy_used"] = use_empathy
+    meta["_first_in_topic"] = first_in_topic
+    meta["_emotional_detected"] = emotional
+    meta["_doc_key"] = doc_key
 
-def generate_empathy(user_q: str, answer: str, intent: str, meta: dict) -> str:
-    """
-    Просим модель вернуть ОДНУ короткую эмпатичную фразу строго по контексту.
-    Возвращаем пустую строку, если не удалось.
-    """
-    topic = meta.get("empathy_tag") or meta.get("topic") or ""
-    # Чтобы не тратить много токенов — даём суть ответа сжатой
-    brief = (answer or "").strip()
-    if len(brief) > 220:
-        brief = brief[:220]
+    return messages, use_empathy, doc_key
 
-    sys = "Ты вежливый ассистент стоматологической клиники. Пиши по-русски на «вы»."
-    rules = (
-        "Задача: дополни ответ одной короткой эмпатичной фразой, точно в контекст.\n"
-        "Строго одно предложение, 6–16 слов. Без диагнозов и обещаний результата.\n"
-        "Не повторяй факты ответа, не используй пафос и уменьшительные. Никаких кавычек и префиксов."
+def generate_answer_with_empathy(user_q: str, context_md: str, meta: dict, session_id: str):
+    mem_add_user(session_id, user_q)
+    mem_txt, profile = mem_context(session_id)
+
+    # Используем оригинальную функцию для построения сообщений с эмпатией
+    messages, use_empathy, doc_key = build_messages_for_gpt(user_q, context_md, meta, session_id)
+    
+    # Добавляем контекст памяти в user сообщение, если есть
+    if mem_txt and MEMORY_ON:
+        # Находим user сообщение и добавляем к нему контекст
+        for msg in messages:
+            if msg["role"] == "user":
+                msg["content"] = f"Недавний диалог:\n{mem_txt}\n\n" + msg["content"]
+                break
+
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        temperature=0.3,
+        messages=messages
     )
-    nuance = {
-        "pain":     "Признай неприятность и поддержи ощущение контроля («разберёмся, подскажем, бережно»).",
-        "price":    "Признай важность бюджета и прозрачность цен.",
-        "time":     "Признай ценность времени и готовность подстроиться.",
-        "warranty": "Уверь, что не бросим и есть понятные решения/гарантийные опции.",
-        "generic":  "Дай тёплую нейтральную поддержку без общих фраз."
-    }.get(intent or "generic")
+    answer = resp.choices[0].message.content.strip()
+    
+    mem_add_bot(session_id, answer)
+    _update_session(session_id, doc_key, use_empathy)
 
-    user = f"""Вопрос пациента: {user_q or '—'}
-Тема: {topic}
-Суть ответа: {brief}
-Интент: {intent or 'generic'}
+    return answer, profile
 
-{rules}
-{nuance}
-Ответь одной строкой — только фраза, без пояснений.
-"""
+# ==== ULTRA-LIGHT MEMORY (MVP) =====================================
+from collections import deque
 
-    try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role":"system","content":sys},
-                      {"role":"user","content":user}],
-            temperature=0.5
-        )
-        line = (resp.choices[0].message.content or "").strip()
-        # Санити: ровно одно предложение и коротко
-        line = line.replace("\n"," ").strip(" «»\"'")
-        if len(line.split()) < 4 or len(line.split()) > 20:
-            return ""
-        # Не начинаем с «Я понимаю», варьируем
-        if line.lower().startswith("я понимаю"):
-            line = line.replace("Я понимаю", "Понимаю", 1)
-        return line
-    except Exception:
-        return ""
+MEMORY_ON = True
+MAX_TURNS = 8          # последние 8 пар "пользователь-бот" хватит
+MAX_IDLE_SEC = 60*60   # сброс после часа простоя
 
-def merge_empathy(answer: str, empathy: str, intent: str) -> str:
-    if not empathy: 
-        return answer
-    # где ставим эмпатию
-    if intent in ("pain","generic"):
-        return f"{empathy} {answer}"
-    else:
-        # цена/время/гарантия — логичнее в конце
-        sep = "\n\n" if len(answer) > 120 else " "
-        return f"{answer}{sep}{empathy}"
+PHONE_RX = re.compile(r"(?:\+7|8)?[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}")
 
-# === Память сессий ===
+SESS = {}  # session_id -> {"hist": deque, "profile": {}, "ts": float}
+
+def _now(): return time.time()
+
 def _sid_from_body(body: dict) -> str:
     sid = (body or {}).get("sid") or ""
     sid = str(sid).strip()
     return sid or uuid.uuid4().hex
 
-def _sess_path(sid: str) -> Path:
-    return SESS_DIR / f"{sid}.json"
+def mem_get(session_id: str):
+    st = SESS.get(session_id)
+    if not st or (_now() - st["ts"] > MAX_IDLE_SEC):
+        st = {"hist": deque(maxlen=MAX_TURNS*2), "profile": {}, "ts": _now()}
+        SESS[session_id] = st
+    return st
 
-def load_mem(sid: str) -> dict:
-    p = _sess_path(sid)
-    if p.exists():
-        try:
-            return json.loads(p.read_text("utf-8"))
-        except Exception:
-            pass
-    return {
-        "sid": sid,
-        "created": int(time.time()),
-        "last_seen": int(time.time()),
-        "turn": 0,
-        "history": [],    # [{role:"user"/"assistant", content:"..."}]
-        "facts": {        # расширяем по мере надобности
-            "name": None,
-            "phone": None,
-            "intents": [],          # ["consultation","price",...]
-            "last_topics": []       # md-файлы или h2_id, шторам
-        }
-    }
+def mem_add_user(session_id: str, text: str):
+    st = mem_get(session_id)
+    st["hist"].append({"role":"user","content":text}); st["ts"]=_now()
+    # очень мягкая выемка телефона/имени (не навязываем)
+    m = PHONE_RX.search(text)
+    if m: st["profile"]["phone"] = m.group().replace(" ", "")
+    if "меня зовут" in text.lower():
+        # простая эвристика: первое слово после "меня зовут"
+        parts = text.lower().split("меня зовут", 1)
+        if len(parts) > 1:
+            name_parts = parts[1].strip().split()
+            if name_parts:
+                name = name_parts[0]
+                if name: st["profile"]["name"] = name.capitalize()
 
-def save_mem(mem: dict):
-    mem["last_seen"] = int(time.time())
-    try:
-        _sess_path(mem["sid"]).write_text(json.dumps(mem, ensure_ascii=False, indent=2), "utf-8")
-    except Exception:
-        pass
+def mem_add_bot(session_id: str, text: str):
+    st = mem_get(session_id)
+    st["hist"].append({"role":"assistant","content":text}); st["ts"]=_now()
 
-def push_history(mem: dict, role: str, text: str):
-    if not text: return
-    mem["history"].append({"role": role, "content": text.strip()})
-    if len(mem["history"]) > MAX_HISTORY:
-        mem["history"] = mem["history"][-MAX_HISTORY:]
-    mem["turn"] = int(mem.get("turn",0)) + (1 if role=="user" else 0)
+def mem_context(session_id: str) -> tuple[str, dict]:
+    """Возвращает короткий контекст для промпта + профиль (name/phone)."""
+    st = mem_get(session_id)
+    history = "\n".join(f"{m['role']}: {m['content']}" for m in list(st["hist"]))
+    return (f"Недавний диалог:\n{history}" if history else ""), st["profile"]
 
-# лёгкий экстрактор фактов (через LLM), безопасно
-FACT_SCHEMA_HINT = (
-  "Верни JSON с полями: name (строка или null), phone (строка в международном виде или null), "
-  "intent (одна строка из: consultation|price|warranty|diagnostics|general или null), "
-  "topics (массив коротких меток или пустой массив). Без пояснений — только JSON."
-)
-
-def extract_facts_llm(user_q: str, answer: str) -> dict:
-    prompt = f"""Пациент пишет: {user_q or '-'}
-Ответ ассистента: {answer or '-'}
-{FACT_SCHEMA_HINT}"""
-    try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role":"system","content":"Ты выделяешь факты из текста и ничего не выдумываешь."},
-                      {"role":"user","content": prompt}],
-            temperature=0.0
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        data = json.loads(raw)
-        return {
-            "name": data.get("name"),
-            "phone": data.get("phone"),
-            "intent": data.get("intent"),
-            "topics": data.get("topics") or []
-        }
-    except Exception:
-        return {}
-
-def build_messages_with_memory(mem: dict, system_prompt: str, user_q: str, base_answer_hint: str = ""):
-    msgs = [{"role":"system","content": system_prompt}]
-    # персонализация
-    name = (mem.get("facts") or {}).get("name")
-    if name:
-        msgs[0]["content"] += f"\nПациента зовут: {name}."
-    # короткий контекст из истории
-    hist = mem.get("history", [])[-(CTX_TURNS*2):]  # парами
-    for h in hist:
-        msgs.append({"role": h["role"], "content": h["content"]})
-    if base_answer_hint:
-        msgs.append({"role":"assistant","content": base_answer_hint})
-    msgs.append({"role":"user","content": user_q})
-    return msgs
-
-def _try_update_name_from_text(mem: dict, text: str, from_assistant: bool = False) -> bool:
-    """Пробуем вытащить имя из реплики и сохранить в mem['facts']['name']."""
-    if not text:
-        return False
-    name = None
-    m = NAME_SET_RE.search(text)
-    if m:
-        name = m.group(1)
-    elif from_assistant:
-        m2 = NAME_IN_ASSIST_RE.search(text)
-        if m2:
-            name = m2.group(1)
-
-    if not name:
-        return False
-
-    cand = name.strip(" .,!?-")
-    # стоп-лист на явно мусорные совпадения
-    if cand.lower() in {"зовут", "звать", "меня", "это"}:
-        return False
-
-    cand = cand.capitalize()
-    mem.setdefault("facts", {})["name"] = cand
-    return True
-
-def _infer_name_from_history(mem: dict) -> str | None:
-    """Если имя не сохранено — попробуем найти его в последних репликах."""
-    for h in reversed(mem.get("history", [])[-10:]):
-        if h["role"] == "user":
-            m = NAME_SET_RE.search(h["content"])
-            if m:
-                return m.group(1).strip(" .,!?-").capitalize()
-        if h["role"] == "assistant":
-            m2 = NAME_IN_ASSIST_RE.search(h["content"])
-            if m2:
-                return m2.group(1).strip(" .,!?-").capitalize()
-    return None
-
-def _update_concerns(mem: dict, user_text: str) -> bool:
-    """Вытащить из реплики формулировку переживания и сохранить в facts['last_concern_text']."""
-    if not user_text or not FEAR_RX.search(user_text):
-        return False
-    txt = None
-    m = FEAR_OF_RX.search(user_text)
-    if m:
-        txt = m.group(1).strip(" ,.;:!?\n\r\t")
-    if not txt:
-        if re.search(r"\bбол(ит|и|ь)\b", user_text, re.I):
-            txt = "боль"
-        elif re.search(r"\bудалени[ея]\b", user_text, re.I):
-            txt = "удаление зуба"
-        elif re.search(r"\bукол|анестез\b", user_text, re.I):
-            txt = "обезболивание/укол"
-    if not txt:
-        txt = "процедура"
-    facts = mem.setdefault("facts", {})
-    facts["last_concern_text"] = txt
-    concerns = facts.setdefault("concerns", [])
-    if txt not in concerns:
-        concerns.append(txt)
-    return True
-
-def _answer_from_concerns(mem: dict) -> str | None:
-    txt = (mem.get("facts") or {}).get("last_concern_text")
-    if not txt:
-        return None
-    return f"Вы писали, что вас тревожит {txt}. Мы всё делаем бережно и объясняем каждый шаг."
+def mem_reset(session_id: str):
+    SESS.pop(session_id, None)
 
 # === Разбор секций в .md и кэш индекса по файлам ===
 _RE_H2 = re.compile(r"^##\s+.*?\{#([a-z0-9\-]+)\}\s*$", re.I | re.M)
@@ -728,22 +628,7 @@ def llm_rerank(q, cands):  # cands: list[dict], len<=3
     
     return result
 
-def compose_answer(q:str, chunk:dict)->str:
-    # минимальный ответ — без копипасты, короткий перефраз (можно выключить)
-    prompt = f"""Отвечай кратко, дружелюбно и по делу (2–4 предложения).
-Перефразируй содержание справки ниже и ответь на вопрос.
-Не придумывай новые факты. Если есть цифры — сохрани их.
-
-Вопрос: {q}
-
-Справка:
-{chunk['text']}
-"""
-    resp = client.chat.completions.create(model=CHAT_MODEL,
-        messages=[{"role":"system","content":"Ты ассистент стоматологической клиники. Пиши просто и понятно."},
-                  {"role":"user","content":prompt}],
-        temperature=0.2)
-    return resp.choices[0].message.content.strip()
+# Старая функция compose_answer удалена - заменена на generate_answer_with_empathy
 
 @app.before_request
 def _before():
@@ -778,55 +663,13 @@ def ask():
         
         # Память сессий
         sid = _sid_from_body(data)
-        mem = load_mem(sid)
-        if data.get("q") == "/reset":
-            # мягкий сброс
-            fresh = load_mem(sid)  # создаст шаблон
-            fresh["sid"] = sid
-            save_mem(fresh)
-            return safe_jsonify({"answer":"Память сессии очищена.", "quick_replies":[], "cta":None, "offer":None, "meta":{"sid":sid}})
         
-        # если пользователь прямо сейчас назвал имя — сохраним
-        if q:
-            if _try_update_name_from_text(mem, q):
-                save_mem(mem)
-
-        # сохраним переживание из реплики, если есть
-        if q:
-            if _update_concerns(mem, q):
-                save_mem(mem)
-
-        # быстрый ответ из памяти на "как меня зовут?"
-        if q and NAME_Q_RE.search(q):
-            name = (mem.get("facts") or {}).get("name")
-            if not name:
-                guessed = _infer_name_from_history(mem)
-                if guessed:
-                    mem.setdefault("facts", {})["name"] = guessed
-                    save_mem(mem)
-                    name = guessed
-            if name:
-                return safe_jsonify({
-                    "answer": f"Вы представились как {name}.",
-                    "quick_replies": [],
-                    "cta": None,
-                    "offer": None,
-                    "meta": {"sid": mem["sid"], "facts": {"name": name}}
-                })
-            # иначе пойдём обычным путём (RAG)
-
-        # быстрый ответ из памяти на "А чего я боюсь?"
-        if q and FEAR_Q_RE.search(q.strip()):
-            memo = _answer_from_concerns(mem)
-            if memo:
-                return safe_jsonify({
-                    "answer": memo,
-                    "quick_replies": [],
-                    "cta": None,
-                    "offer": None,
-                    "meta": {"sid": mem["sid"], "facts": {"last_concern_text": (mem.get('facts') or {}).get('last_concern_text')}}
-                })
-            # если пусто — обычный поток
+        # Команда сброса памяти
+        if data.get("q") and data.get("q").strip().lower() in ("/reset", "/новая"):
+            mem_reset(sid)
+            return safe_jsonify({"answer":"Начнём заново. Чем помочь?", "quick_replies":[], "cta":None, "offer":None, "meta":{"sid":sid}})
+        
+        # Новая система памяти работает автоматически через generate_answer_with_empathy
         
         # Если есть ref - попробуем найти чанк по ссылке
         if ref:
@@ -834,7 +677,14 @@ def ask():
             if ch:
                 top = ch
                 # Генерируем ответ для найденного чанка
-                answer = compose_answer(q or f"Информация из {ref}", top)
+                md_file = top.get("file")
+                meta_doc = get_doc_meta(os.path.basename(md_file or "")) or {}
+                answer, profile = generate_answer_with_empathy(
+                    q or f"Информация из {ref}", 
+                    top.get("text", ""), 
+                    meta_doc, 
+                    sid
+                )
                 
                 # Фолбэк для пустого ответа
                 if not isinstance(answer, str) or not answer.strip():
@@ -847,13 +697,10 @@ def ask():
                          file=top.get("file"), score=round(float(top.get("_score",0.0)),3), answer_length=len(answer))
                 
                 # Сборка UX-данных
-                md_file = top.get("file")
                 h2_id, h3_id = _get_ids(top)
                 h2_val = top.get("h2") or top.get("h2_id")
                 h3_val = top.get("h3") or top.get("h3_id")
                 is_overview = _is_overview_by_ids(h2_id, h3_id)
-
-                meta_doc = get_doc_meta(os.path.basename(md_file or "")) or {}
 
                 quick_refs = _build_quick_refs(meta_doc, md_file, h2_id, h3_id)
                 fups_full  = _build_followups(meta_doc, md_file, h2_id, h3_id)
@@ -863,48 +710,14 @@ def ask():
 
                 score = float(round(float(top.get("_score", 0.0)), 3))
                 
-                # авто-добор имени из ответа ассистента
-                _try_update_name_from_text(mem, answer, from_assistant=True)
-                
-                # Обновление памяти
-                push_history(mem, "user", q or (ref and f"[REF] {ref}") or "")
-                push_history(mem, "assistant", answer)
-                
-                # извлечь факты
-                facts_upd = extract_facts_llm(q, answer)
-                if facts_upd:
-                    f = mem.get("facts", {})
-                    if facts_upd.get("name"):  f["name"] = facts_upd["name"]
-                    if facts_upd.get("phone"): f["phone"] = facts_upd["phone"]
-                    if facts_upd.get("intent"):
-                        intents = set(f.get("intents", []))
-                        intents.add(facts_upd["intent"])
-                        f["intents"] = list(intents)
-                    if facts_upd.get("topics"):
-                        existing = set(f.get("last_topics", []))
-                        for t in facts_upd["topics"]:
-                            existing.add(t)
-                        f["last_topics"] = list(existing)[-5:]
-                    mem["facts"] = f
-                
-                # запоминаем тему (файл/секция)
-                try:
-                    if md_file:
-                        facts = mem.get("facts",{})
-                        topics = facts.get("last_topics",[])
-                        if os.path.basename(md_file) not in topics:
-                            topics.append(os.path.basename(md_file))
-                            facts["last_topics"] = topics[-5:]
-                        mem["facts"] = facts
-                except Exception:
-                    pass
-                
-                save_mem(mem)
+                # Новая система памяти работает автоматически
+                cta_btn = _build_cta(meta_doc)
+                quick_refs = _dedup_refs_vs_cta(quick_refs, cta_btn)
 
                 payload = {
                     "answer": answer,
-                    "quick_replies": quick_refs,   # только suggest_refs
-                    "cta": _build_cta(meta_doc),
+                    "quick_replies": quick_refs,      # только внешние ссылки
+                    "cta": cta_btn,                   # отдельная CTA кнопка
                     "offer": _pick_relevant_offer(meta_doc),
                     "meta": {
                         "file": md_file,
@@ -916,8 +729,8 @@ def ask():
                         "cta_mode": meta_doc.get("cta_mode"),
                         "tags": (list(meta_doc.get("tags")) if isinstance(meta_doc.get("tags"), set) else (meta_doc.get("tags") or [])),
                         "sid": sid,
-                        "facts": { "name": mem.get("facts",{}).get("name"),
-                                   "phone": mem.get("facts",{}).get("phone") }
+                        "facts": { "name": profile.get("name"),
+                                   "phone": profile.get("phone") }
                     }
                 }
 
@@ -966,7 +779,8 @@ def ask():
                          chosen=_chunk_info(final_chunk, final_score))
                 
                 # Генерация ответа для контактного запроса
-                answer = compose_answer(q, final_chunk)
+                meta = get_doc_meta(os.path.basename(final_chunk.get("file",""))) or {}
+                answer, profile = generate_answer_with_empathy(q, final_chunk.get("text", ""), meta, sid)
                 
                 # Фолбэк для пустого ответа
                 if not isinstance(answer, str) or not answer.strip():
@@ -978,19 +792,11 @@ def ask():
                          file=final_chunk["file"], score=round(float(final_score),3), answer_length=len(answer))
                 
                 # Сборка UX-данных
-                meta = get_doc_meta(os.path.basename(final_chunk.get("file",""))) or {}
                 md_file = final_chunk.get("file")
                 h2_id, h3_id = _get_ids(final_chunk)
                 h2_val = final_chunk.get("h2") or final_chunk.get("h2_id")
                 h3_val = final_chunk.get("h3") or final_chunk.get("h3_id")
                 is_overview = _is_overview_by_ids(h2_id, h3_id)
-                
-                # Эмпатия
-                need, intent = should_add_empathy(q, meta, request.ctx)
-                empathy_line = generate_empathy(q, answer, intent, meta) if need else ""
-                if empathy_line:
-                    answer = merge_empathy(answer, empathy_line, intent)
-                    request.ctx["last_empathy_turn"] = _last_turn(request.ctx)
 
                 quick_refs = _build_quick_refs(meta, md_file, h2_id, h3_id)
                 fups_full  = _build_followups(meta, md_file, h2_id, h3_id)
@@ -1001,13 +807,14 @@ def ask():
                 # score всегда приводим к float
                 score = float(round(float(final_score), 3))
                 
-                # авто-добор имени из ответа ассистента
-                _try_update_name_from_text(mem, answer, from_assistant=True)
+                # Новая система памяти работает автоматически
+                cta_btn = _build_cta(meta)
+                quick_refs = _dedup_refs_vs_cta(quick_refs, cta_btn)
                 
                 return safe_jsonify({
                     "answer": answer,
-                    "quick_replies": quick_refs,   # только suggest_refs
-                    "cta": _build_cta(meta),
+                    "quick_replies": quick_refs,      # только внешние ссылки
+                    "cta": cta_btn,                   # отдельная CTA кнопка
                     "offer": _pick_relevant_offer(meta),
                     "meta": {
                         "file": final_chunk.get("file"),
@@ -1035,7 +842,8 @@ def ask():
                          original_top_score=(round(float(_score_of(cands[0])),4) if cands else None),
                          rerank_applied=False,
                          chosen=_chunk_info(final_chunk, final_score))
-                answer = compose_answer(q, final_chunk)
+                meta = get_doc_meta(os.path.basename(final_chunk.get("file",""))) or {}
+                answer, profile = generate_answer_with_empathy(q, final_chunk.get("text", ""), meta, sid)
                 
                 # Фолбэк для пустого ответа
                 if not isinstance(answer, str) or not answer.strip():
@@ -1046,19 +854,11 @@ def ask():
                 log_json(logger, "Answer generated", file=final_chunk["file"], score=round(float(final_score),3), answer_length=len(answer))
                 
                 # Сборка UX-данных
-                meta = get_doc_meta(os.path.basename(final_chunk.get("file",""))) or {}
                 md_file = final_chunk.get("file")
                 h2_id, h3_id = _get_ids(final_chunk)
                 h2_val = final_chunk.get("h2") or final_chunk.get("h2_id")
                 h3_val = final_chunk.get("h3") or final_chunk.get("h3_id")
                 is_overview = _is_overview_by_ids(h2_id, h3_id)
-                
-                # Эмпатия
-                need, intent = should_add_empathy(q, meta, request.ctx)
-                empathy_line = generate_empathy(q, answer, intent, meta) if need else ""
-                if empathy_line:
-                    answer = merge_empathy(answer, empathy_line, intent)
-                    request.ctx["last_empathy_turn"] = _last_turn(request.ctx)
 
                 quick_refs = _build_quick_refs(meta, md_file, h2_id, h3_id)
                 fups_full  = _build_followups(meta, md_file, h2_id, h3_id)
@@ -1069,43 +869,8 @@ def ask():
                 # score всегда приводим к float
                 score = float(round(float(final_score), 3))
                 
-                # авто-добор имени из ответа ассистента
-                _try_update_name_from_text(mem, answer, from_assistant=True)
+                # Новая система памяти работает автоматически
                 
-                # Обновление памяти
-                push_history(mem, "user", q or (ref and f"[REF] {ref}") or "")
-                push_history(mem, "assistant", answer)
-                
-                # извлечь факты
-                facts_upd = extract_facts_llm(q, answer)
-                if facts_upd:
-                    f = mem.get("facts", {})
-                    if facts_upd.get("name"):  f["name"] = facts_upd["name"]
-                    if facts_upd.get("phone"): f["phone"] = facts_upd["phone"]
-                    if facts_upd.get("intent"):
-                        intents = set(f.get("intents", []))
-                        intents.add(facts_upd["intent"])
-                        f["intents"] = list(intents)
-                    if facts_upd.get("topics"):
-                        existing = set(f.get("last_topics", []))
-                        for t in facts_upd["topics"]:
-                            existing.add(t)
-                        f["last_topics"] = list(existing)[-5:]
-                    mem["facts"] = f
-                
-                # запоминаем тему (файл/секция)
-                try:
-                    if md_file:
-                        facts = mem.get("facts",{})
-                        topics = facts.get("last_topics",[])
-                        if os.path.basename(md_file) not in topics:
-                            topics.append(os.path.basename(md_file))
-                            facts["last_topics"] = topics[-5:]
-                        mem["facts"] = facts
-                except Exception:
-                    pass
-                
-                save_mem(mem)
                 
                 return safe_jsonify({
                     "answer": answer,
@@ -1122,8 +887,8 @@ def ask():
                         "cta_mode": meta.get("cta_mode"),
                         "tags": (list(meta.get("tags")) if isinstance(meta.get("tags"), set) else (meta.get("tags") or [])),
                         "sid": sid,
-                        "facts": { "name": mem.get("facts",{}).get("name"),
-                                   "phone": mem.get("facts",{}).get("phone") }
+                        "facts": { "name": profile.get("name"),
+                                   "phone": profile.get("phone") }
                     }
                 })
         
@@ -1143,7 +908,8 @@ def ask():
                  rerank_applied=bool(use_rerank),
                  chosen=_chunk_info(top, top.get("_score") if isinstance(top, dict) else None))
         
-        answer = compose_answer(q, top)  # если хочешь без LLM — просто answer = top["text"]
+        meta = get_doc_meta(os.path.basename(top.get("file",""))) or {}
+        answer, profile = generate_answer_with_empathy(q, top.get("text", ""), meta, sid)
         
         # Фолбэк для пустого ответа
         if not isinstance(answer, str) or not answer.strip():
@@ -1156,19 +922,11 @@ def ask():
                  file=top["file"], score=round(float(top.get("_score",0.0)),3), answer_length=len(answer))
         
         # Сборка UX-данных
-        meta = get_doc_meta(os.path.basename(top.get("file",""))) or {}
         md_file = top.get("file")
         h2_id, h3_id = _get_ids(top)
         h2_val = top.get("h2") or top.get("h2_id")
         h3_val = top.get("h3") or top.get("h3_id")
         is_overview = _is_overview_by_ids(h2_id, h3_id)
-        
-        # Эмпатия
-        need, intent = should_add_empathy(q, meta, request.ctx)
-        empathy_line = generate_empathy(q, answer, intent, meta) if need else ""
-        if empathy_line:
-            answer = merge_empathy(answer, empathy_line, intent)
-            request.ctx["last_empathy_turn"] = _last_turn(request.ctx)
 
         quick_refs = _build_quick_refs(meta, md_file, h2_id, h3_id)
         fups_full  = _build_followups(meta, md_file, h2_id, h3_id)
@@ -1179,48 +937,14 @@ def ask():
         # score всегда приводим к float
         score = float(round(float(top.get("_score", 0.0)), 3))
         
-        # авто-добор имени из ответа ассистента
-        _try_update_name_from_text(mem, answer, from_assistant=True)
-        
-        # Обновление памяти
-        push_history(mem, "user", q or (ref and f"[REF] {ref}") or "")
-        push_history(mem, "assistant", answer)
-        
-        # извлечь факты
-        facts_upd = extract_facts_llm(q, answer)
-        if facts_upd:
-            f = mem.get("facts", {})
-            if facts_upd.get("name"):  f["name"] = facts_upd["name"]
-            if facts_upd.get("phone"): f["phone"] = facts_upd["phone"]
-            if facts_upd.get("intent"):
-                intents = set(f.get("intents", []))
-                intents.add(facts_upd["intent"])
-                f["intents"] = list(intents)
-            if facts_upd.get("topics"):
-                existing = set(f.get("last_topics", []))
-                for t in facts_upd["topics"]:
-                    existing.add(t)
-                f["last_topics"] = list(existing)[-5:]
-            mem["facts"] = f
-        
-        # запоминаем тему (файл/секция)
-        try:
-            if md_file:
-                facts = mem.get("facts",{})
-                topics = facts.get("last_topics",[])
-                if os.path.basename(md_file) not in topics:
-                    topics.append(os.path.basename(md_file))
-                    facts["last_topics"] = topics[-5:]
-                mem["facts"] = facts
-        except Exception:
-            pass
-        
-        save_mem(mem)
+        # Новая система памяти работает автоматически
+        cta_btn = _build_cta(meta)
+        quick_refs = _dedup_refs_vs_cta(quick_refs, cta_btn)
         
         return safe_jsonify({
             "answer": answer,
-            "quick_replies": quick_refs,   # только suggest_refs
-            "cta": _build_cta(meta),
+            "quick_replies": quick_refs,      # только внешние ссылки
+            "cta": cta_btn,                   # отдельная CTA кнопка
             "offer": _pick_relevant_offer(meta),
             "meta": {
                 "file": top.get("file"),
@@ -1232,8 +956,8 @@ def ask():
                 "cta_mode": meta.get("cta_mode"),
                 "tags": (list(meta.get("tags")) if isinstance(meta.get("tags"), set) else (meta.get("tags") or [])),
                 "sid": sid,
-                "facts": { "name": mem.get("facts",{}).get("name"),
-                           "phone": mem.get("facts",{}).get("phone") }
+                "facts": { "name": profile.get("name"),
+                           "phone": profile.get("phone") }
             }
         })
         
@@ -1258,13 +982,7 @@ def dbg():
 def static_files(path):
     return send_from_directory("static", path)
 
-# статическая раздача JSON памяти
-@app.route("/static/sessions/<sid>.json")
-def _dbg_session(sid):
-    p = _sess_path(sid)
-    if not p.exists():
-        return ("{}", 200, {"Content-Type":"application/json; charset=utf-8"})
-    return (p.read_text("utf-8"), 200, {"Content-Type":"application/json; charset=utf-8"})
+# Старая функция раздачи JSON памяти удалена - новая система работает в памяти
 
 # эндпоинт приёма заявок
 @app.post("/lead")

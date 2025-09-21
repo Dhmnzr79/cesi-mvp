@@ -18,7 +18,6 @@ cta_text: "Уточнить детали на консультации"
 cta_action: "consultation"
 # Один чанк: кнопки только на внешние разделы
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Адрес и контакты",       ref: "clinic-contacts.md#overview" }
 updated: "2025-09-12"
 ---

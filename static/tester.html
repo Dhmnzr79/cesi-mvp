@@ -456,6 +456,12 @@ function renderUx(containerEl, resp){
   let followups = Array.isArray(meta.followups) ? meta.followups : [];
   let quickRefs = Array.isArray(resp.quick_replies) ? resp.quick_replies : [];
 
+  // Удалим внешние ссылки, дублирующие CTA по подписи
+  if (resp.cta && resp.cta.text) {
+    const ctaLabel = (resp.cta.text || '').trim().toLowerCase();
+    quickRefs = quickRefs.filter(x => (x.label || '').trim().toLowerCase() !== ctaLabel);
+  }
+
   // Дедуп по label/ref, приоритет у quickRefs
   const labelsInRefs = new Set(quickRefs.map(x => (x.label||'').toLowerCase()));
   followups = followups.filter(x => !labelsInRefs.has((x.label||'').toLowerCase()));

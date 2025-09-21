@@ -41,6 +41,9 @@ def load_doc_meta(md_root: str = "md") -> dict:
                 "verbatim_ids": fm.get("verbatim_ids") or [],
                 "suggest_h3": fm.get("suggest_h3") or [],
                 "suggest_refs": fm.get("suggest_refs") or [],
+                # ↓↓↓ ЭМПАТИЯ ↓↓↓
+                "empathy_enabled": bool(fm.get("empathy_enabled", False)),
+                "empathy_tag": fm.get("empathy_tag"),
             }
     return meta
 

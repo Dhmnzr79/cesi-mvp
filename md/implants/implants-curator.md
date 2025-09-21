@@ -15,7 +15,6 @@ preferred_format: ["short","bullets"]
 cta_text: "Познакомиться с куратором на консультации"
 cta_action: "consultation"
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Виды имплантов", ref: "implants-brands.md#overview" }
 updated: "2025-09-20"
 ---

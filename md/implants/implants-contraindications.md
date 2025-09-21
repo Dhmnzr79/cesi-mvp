@@ -16,7 +16,6 @@ cta_action: "consultation"
 suggest_h3:
   - "diabet"
 suggest_refs:
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
   - { label: "Костная пластика", ref: "bone-graft.md#overview" }
 updated: "2025-09-20"
 ---

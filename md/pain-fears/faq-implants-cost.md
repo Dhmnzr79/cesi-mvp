@@ -19,7 +19,6 @@ suggest_h3:
   - "u-konkurentov-deshevle"
 suggest_refs:
   - { label: "Цены на имплантацию", ref: "prices-implant.md#overview" }
-  - { label: "Бесплатная консультация", ref: "consultation-free.md#overview" }
 updated: "2025-09-20"
 ---
 
